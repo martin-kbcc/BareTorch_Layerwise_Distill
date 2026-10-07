@@ -41,7 +41,7 @@ SAVE_STEPS=380        # Mid-point checkpoint
 LOGGING_STEPS=50      # Step logging interval
 
 # Cloudflare R2 Sync Settings
-ENABLE_R2_SYNC=${ENABLE_R2_SYNC:-false}
+ENABLE_R2_SYNC=${ENABLE_R2_SYNC:-true}
 R2_BUCKET=${R2_BUCKET:-"baretorch-data"}
 R2_PREFIX=${R2_PREFIX:-"qwen3.5_2B_checkpoints_layers"}
 

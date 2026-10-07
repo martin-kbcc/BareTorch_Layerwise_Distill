@@ -47,7 +47,7 @@ SAVE_STEPS=1000
 EVAL_STEPS=1000
 
 # Cloudflare R2 Cloud Sync Settings
-ENABLE_R2_SYNC=false
+ENABLE_R2_SYNC=true
 R2_BUCKET="baretorch-data"
 R2_PREFIX="qwen3.5_2B_clm_checkpoints"
 
