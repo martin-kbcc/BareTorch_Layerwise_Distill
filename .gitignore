@@ -1,0 +1,30 @@
+# Data directories
+data*/
+data*
+
+# Lowercase qwen directories and files (checkpoints, caches, features)
+qwen*
+
+# Keep uppercase Qwen runner folders explicitly
+!Qwen*/
+
+# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Binary weights and temporary memmap dumps
+*.pt
+*.bin
+*.tmp
+*.memmap
+
+# Environments & IDEs
+.venv/
+env/
+venv/
+.idea/
+.vscode/
+.DS_Store
