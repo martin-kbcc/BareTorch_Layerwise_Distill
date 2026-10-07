@@ -29,16 +29,16 @@ D_MODEL=2048
 NUM_HEADS=16
 
 # Extraction Parameters
-EXTRACT_BATCH_SIZE=32
+EXTRACT_BATCH_SIZE=64
 
 # Training Parameters (100M Tokens)
-TRAIN_BATCH_SIZE=64
+TRAIN_BATCH_SIZE=128
 GRAD_ACCUM=1
 LEARNING_RATE="1e-3"
-MAX_STEPS=763         # 1 full epoch over 100M tokens @ batch_size 64
-WARMUP_STEPS=75       # ~10% warmup
-SAVE_STEPS=380        # Mid-point checkpoint
-LOGGING_STEPS=50      # Step logging interval
+MAX_STEPS=100         # 1 full epoch over 100M tokens @ batch_size 64
+WARMUP_STEPS=10       # ~10% warmup
+SAVE_STEPS=50        # Mid-point checkpoint
+LOGGING_STEPS=10      # Step logging interval
 
 # Cloudflare R2 Sync Settings
 ENABLE_R2_SYNC=${ENABLE_R2_SYNC:-true}
