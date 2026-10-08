@@ -742,7 +742,7 @@ def main():
     parser.add_argument(
         "--grad_checkpointing",
         action="store_true",
-        default=True,
+        default=False,
         help="Enable Gradient Checkpointing to conserve VRAM.",
     )
     parser.add_argument("--logging_steps", type=int, default=10)
