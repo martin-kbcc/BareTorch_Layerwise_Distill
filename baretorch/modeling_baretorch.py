@@ -27,7 +27,14 @@ class BareTorchPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def _set_gradient_checkpointing(self, enable=True, gradient_checkpointing_func=None):
+    def _set_gradient_checkpointing(self, enable=True, gradient_checkpointing_func=None, *args, **kwargs):
+        """
+        Flexible gradient checkpointing setter accepting arbitrary Hugging Face kwargs
+        (e.g., every_n_layers, value) across transformers version updates.
+        """
+        if "value" in kwargs:
+            enable = kwargs.pop("value")
+            
         if gradient_checkpointing_func is None:
             gradient_checkpointing_func = partial(checkpoint.checkpoint, use_reentrant=False)
 

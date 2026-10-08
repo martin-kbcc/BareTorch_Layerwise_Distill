@@ -1,4 +1,4 @@
-# /home/martinkb/Desktop/BareTorch_Layerwise_Distill/train_layer_alignment_ddp.py
+# /home/martinkb/Desktop/BareTorch_Layerwise_Distill/train_stage_2.py
 import sys
 import os
 
@@ -628,7 +628,12 @@ def assemble_full_baretorch_model(
     torch.cuda.empty_cache()
 
     if config.use_grad_checkpointing:
-        model.gradient_checkpointing_enable()
+        try:
+            model.gradient_checkpointing_enable()
+        except TypeError:
+            for module in model.modules():
+                if hasattr(module, "gradient_checkpointing"):
+                    module.gradient_checkpointing = True
 
     if local_rank == 0:
         logger.info("✅ Model Assembly Complete! VRAM usage fully optimized.")
