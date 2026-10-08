@@ -37,9 +37,9 @@ SCHEDULER="cosine"
 WARMUP_STEPS=500
 WEIGHT_DECAY="0.01"
 
-# Per-GPU Hardware Allocation (Total Effective Batch Size = 16 * 1 * 8 = 128)
-BATCH_SIZE=16
-GRAD_ACCUM=1
+# Per-GPU Hardware Allocation (Total Effective Batch Size = 8 * 2 * 8 = 128)
+BATCH_SIZE=8
+GRAD_ACCUM=2
 
 # Checkpoint & Eval Frequency
 LOGGING_STEPS=250
