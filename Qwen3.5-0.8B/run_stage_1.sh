@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 BareTorch Stage 3: Data Preparation & Sync Runner (1B Tokens for Qwen3.5-0.8B)
+# 🚀 BareTorch: Data Preparation & Sync Runner (20B Tokens for Full Scale Distillation)
 # ==============================================================================
-# Description: Syncs the 1B token multi-domain teacher predictions binary dataset
-#              from Cloudflare R2 required for Stage 4 global logit distillation.
+# Description: Syncs the 20B token multi-domain binary dataset shards from Cloudflare
+#              R2 to local NVMe storage for the 2.5B model distillation run.
 # ==============================================================================
 
 set -euo pipefail
@@ -11,21 +11,37 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
 
-DATA_TARGET_DIR="${PROJECT_ROOT}/data_1B/train"
-TOTAL_TOKENS="1000000000"
+# Target directory on NVMe storage (or project root)
+DATA_TARGET_DIR="${PROJECT_ROOT}/data_20B/train"
+TOTAL_TOKENS="20000000000"
+
+# Prefer the generic sync script if present, otherwise fall back to sync_1b_dataset.py
+SYNC_SCRIPT="${PROJECT_ROOT}/sync_dataset.py"
+if [ ! -f "${SYNC_SCRIPT}" ]; then
+    SYNC_SCRIPT="${PROJECT_ROOT}/sync_1b_dataset.py"
+fi
+
+mkdir -p "${DATA_TARGET_DIR}"
 
 echo "=================================================================="
-echo "🚀 Starting Stage 3 Dataset Sync (1B Tokens across 7 Domains)"
+echo "🚀 Starting Dataset Sync: 20 Billion Tokens (7-Domain Mixture)"
 echo "=================================================================="
 echo "Project Root       : ${PROJECT_ROOT}"
+echo "Sync Script        : ${SYNC_SCRIPT}"
 echo "Target Directory   : ${DATA_TARGET_DIR}"
-echo "Total Tokens       : ${TOTAL_TOKENS}"
+echo "Total Tokens       : ${TOTAL_TOKENS} (20 Billion Tokens)"
 echo "=================================================================="
 
-python3 "${PROJECT_ROOT}/sync_1b_dataset.py" \
+python3 "${SYNC_SCRIPT}" \
     --target_dir "${DATA_TARGET_DIR}" \
     --total_tokens "${TOTAL_TOKENS}"
 
 echo "=================================================================="
-echo "✅ Stage 3 Dataset Sync Complete!"
+echo "✅ 20BT Dataset Sync Complete!"
+echo "   Verifying downloaded shards in: ${DATA_TARGET_DIR}"
 echo "=================================================================="
+
+# Print summary of downloaded shard files and total disk space
+ls -lh "${DATA_TARGET_DIR}" | head -n 15
+echo "Total size on disk:"
+du -sh "${DATA_TARGET_DIR}"

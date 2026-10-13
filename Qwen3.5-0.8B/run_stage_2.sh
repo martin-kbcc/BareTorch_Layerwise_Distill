@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 BareTorch: Direct End-to-End Distillation Runner (0.8B Model on 8x H100)
+# 🚀 BareTorch: Direct End-to-End Distillation Runner (20BT Production Run)
 # ==============================================================================
-# Description: Rapid 1BT calibration runner across 8 H100 SXM5 GPUs.
-#              Directly warm-starts from Qwen3.5-0.8B via weight surgery:
-#              - Phase 1 (200M tokens / 381 steps): Recurrent routing adaptation (Backbone frozen)
-#              - Phase 2 (800M tokens / 1,527 steps): Global co-adaptation (Differential LRs)
+# Description: Full-scale 20BT distillation runner across 8 H100 SXM5 GPUs.
+#              - Phase 1 (2.0BT / 3,815 steps): Recurrent routing adaptation (Backbone frozen)
+#              - Phase 2 (18.0BT / 34,332 steps): Global co-adaptation (Differential LRs)
+#              - Automated Cloudflare R2 checkpoint synchronization enabled
 # ==============================================================================
 
 set -euo pipefail
@@ -23,8 +23,8 @@ NUM_GPUS=8
 PYTHON_SCRIPT="${PROJECT_ROOT}/train_stage_1.py"
 
 # Path Directories
-DATA_CACHE_DIR="${PROJECT_ROOT}/data_1B/train"
-OUTPUT_DIR="${PROJECT_ROOT}/qwen3.5_0.8B_clm_checkpoints_lr7.5e-4"
+DATA_CACHE_DIR="${PROJECT_ROOT}/data_20B/train"
+OUTPUT_DIR="${PROJECT_ROOT}/qwen3.5_0.8B_clm_checkpoints_20BT_lr1e-3"
 TEACHER_MODEL="Qwen/Qwen3.5-0.8B"
 LAYER_SEQUENCE="cs_lrad,cs_lrad,cs_lrad,transformer"
 
@@ -41,29 +41,29 @@ SEQ_LEN=2048
 BATCH_SIZE=8
 GRAD_ACCUM=4
 
-# Hyperparameters (1 Billion Tokens @ Effective Batch Size 256)
-# Total Steps for 1B Tokens = 1,000,000,000 / 524,288 ≈ 1,908 steps
-# Phase 1 Steps for 200M Tokens (20%) = 200,000,000 / 524,288 ≈ 381 steps
-# Phase 2 Steps for 800M Tokens (80%) = 1,908 - 381 = 1,527 steps
-MAX_STEPS=1908
-PHASE1_STEPS=381
-WARMUP_STEPS=150
+# Hyperparameters (20 Billion Tokens @ Effective Batch Size 256)
+# Total Steps for 20B Tokens = 20,000,000,000 / 524,288 ≈ 38,147 steps
+# Phase 1 Steps for 2B Tokens (10%) = 2,000,000,000 / 524,288 ≈ 3,815 steps
+# Phase 2 Steps for 18B Tokens (90%) = 38,147 - 3,815 = 34,332 steps
+MAX_STEPS=38147
+PHASE1_STEPS=3815
+WARMUP_STEPS=1000
 WEIGHT_DECAY="0.01"
 
-# Differential Learning Rates (Baseline Settings for Sweep)
-LEARNING_RATE="7.5e-4"       # Base LR for CS-LRAD mixer layers
-BACKBONE_LR_RATIO="0.1"     # 0.1 * 7.5e-4 = 7.5e-5 for MLPs & Attention
-EMB_LR_RATIO="0.02"          # 0.02 * 7.5e-4 = 1.5e-5 for Embeddings & LM Head
+# Differential Learning Rates
+LEARNING_RATE="1e-3"         # Base LR for CS-LRAD mixer layers
+BACKBONE_LR_RATIO="0.1"      # 0.1 * 1e-3 = 1e-4 for MLPs & Attention
+EMB_LR_RATIO="0.02"          # 0.02 * 1e-3 = 2e-5 for Embeddings & LM Head
 
-# Checkpoint & Eval Frequency (Scaled for 1,908 total steps to monitor loss curve)
-LOGGING_STEPS=25
-SAVE_STEPS=250
-EVAL_STEPS=250
+# Checkpoint & Eval Frequency
+LOGGING_STEPS=250
+SAVE_STEPS=1000
+EVAL_STEPS=1000
 
 # Cloudflare R2 Sync Settings
-ENABLE_R2_SYNC=false
+ENABLE_R2_SYNC=true
 R2_BUCKET="baretorch-data"
-R2_PREFIX="qwen3.5_0.8B_clm_checkpoints"
+R2_PREFIX="qwen3.5_0.8B_clm_checkpoints_20BT"
 
 # ------------------------------------------------------------------------------
 # 2. Environment Variables & Hardware Optimizations
@@ -79,7 +79,7 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 TOKENS_PER_STEP=$(( BATCH_SIZE * GRAD_ACCUM * NUM_GPUS * SEQ_LEN ))
 
 echo "=================================================================="
-echo "🚀 Initializing BareTorch 0.8B Calibration Run (8x H100)"
+echo "🚀 Initializing BareTorch 0.8B Production Distillation (8x H100)"
 echo "=================================================================="
 echo "Target Script          : ${PYTHON_SCRIPT}"
 echo "Number of GPUs         : ${NUM_GPUS}x H100 SXM5"
@@ -90,13 +90,13 @@ echo "Dataset Directory      : ${DATA_CACHE_DIR}"
 echo "Output Directory       : ${OUTPUT_DIR}"
 echo "Batch Configuration    : ${NUM_GPUS} GPUs x ${BATCH_SIZE} batch x ${GRAD_ACCUM} accum"
 echo "Tokens per Step        : ${TOKENS_PER_STEP} (524,288 tokens/step)"
-echo "Total Training Steps   : ${MAX_STEPS} (~1 Billion Tokens)"
-echo "Phase 1 Steps (CS-LRAD): 0 to ${PHASE1_STEPS} (~200 Million Tokens, Backbone Frozen)"
-echo "Phase 2 Steps (Global) : ${PHASE1_STEPS} to ${MAX_STEPS} (~800 Million Tokens, Co-Adaptation)"
+echo "Total Training Steps   : ${MAX_STEPS} (~20 Billion Tokens)"
+echo "Phase 1 Steps (CS-LRAD): 0 to ${PHASE1_STEPS} (~2 Billion Tokens, Backbone Frozen)"
+echo "Phase 2 Steps (Global) : ${PHASE1_STEPS} to ${MAX_STEPS} (~18 Billion Tokens, Co-Adaptation)"
 echo "Base LR (CS-LRAD)      : ${LEARNING_RATE}"
 echo "Backbone Peak LR       : $(python3 -c "print(${LEARNING_RATE} * ${BACKBONE_LR_RATIO})") (Ratio: ${BACKBONE_LR_RATIO})"
 echo "Embeddings Peak LR     : $(python3 -c "print(${LEARNING_RATE} * ${EMB_LR_RATIO})") (Ratio: ${EMB_LR_RATIO})"
-echo "Cloudflare R2 Sync     : ${ENABLE_R2_SYNC}"
+echo "Cloudflare R2 Sync     : ${ENABLE_R2_SYNC} (Target: r2://${R2_BUCKET}/${R2_PREFIX})"
 echo "=================================================================="
 
 if [ ! -d "${DATA_CACHE_DIR}" ]; then
@@ -148,6 +148,6 @@ torchrun --nproc_per_node="${NUM_GPUS}" "${PYTHON_SCRIPT}" \
     ${R2_FLAG}
 
 echo "=================================================================="
-echo "🎉 0.8B 1BT CALIBRATION DISTILLATION COMPLETE!"
+echo "🎉 20BT DISTILLATION RUN COMPLETE!"
 echo "   Consolidated model weights and tokenizer saved to '${OUTPUT_DIR}'"
 echo "=================================================================="
