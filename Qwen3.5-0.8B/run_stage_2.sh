@@ -36,10 +36,10 @@ CHUNK_SIZE=32
 RANK=16
 SEQ_LEN=2048
 
-# Hardware Allocation (Effective Batch Size = 8 GPUs * 16 batch * 2 accum = 256 sequences)
+# Hardware Allocation (Effective Batch Size = 8 GPUs * 8 batch * 4 accum = 256 sequences)
 # Tokens per step = 256 * 2048 = 524,288 tokens/step
-BATCH_SIZE=16
-GRAD_ACCUM=2
+BATCH_SIZE=8
+GRAD_ACCUM=4
 
 # Hyperparameters (1 Billion Tokens @ Effective Batch Size 256)
 # Total Steps for 1B Tokens = 1,000,000,000 / 524,288 ≈ 1,908 steps
@@ -51,9 +51,9 @@ WARMUP_STEPS=150
 WEIGHT_DECAY="0.01"
 
 # Differential Learning Rates (Baseline Settings for Sweep)
-LEARNING_RATE="2.5e-4"       # Base LR for CS-LRAD mixer layers
-BACKBONE_LR_RATIO="0.08"     # 0.08 * 2.5e-4 = 2.0e-5 for MLPs & Attention
-EMB_LR_RATIO="0.02"          # 0.02 * 2.5e-4 = 5.0e-6 for Embeddings & LM Head
+LEARNING_RATE="5e-4"       # Base LR for CS-LRAD mixer layers
+BACKBONE_LR_RATIO="0.1"     # 0.1 * 5e-4 = 5.0e-5 for MLPs & Attention
+EMB_LR_RATIO="0.02"          # 0.02 * 5e-4 = 1.0e-5 for Embeddings & LM Head
 
 # Checkpoint & Eval Frequency (Scaled for 1,908 total steps to monitor loss curve)
 LOGGING_STEPS=25
