@@ -1,166 +1,150 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 BareTorch Stage 2: 3:1 Hybrid Layerwise Distillation Runner (Qwen3.5-2B)
+# 🚀 BareTorch: Direct End-to-End Distillation Runner (20BT Budget on 8x H100)
 # ==============================================================================
-# Description: Extracts layerwise hidden states and trains CS-LRAD single-layer
-#              sub-modules across 24 layers using 8 GPUs.
+# Description: Launches 24-layer end-to-end logit distillation across 8 H100 GPUs.
+#              Directly warm-starts from Qwen3.5-2B via weight surgery and executes:
+#              - Phase 1 (4BT / 15,258 steps): Recurrent routing adaptation (Backbone frozen)
+#              - Phase 2 (16BT / 61,034 steps): Global co-adaptation (Differential LRs)
 # ==============================================================================
 
 set -euo pipefail
 
-# Layer range arguments (0 to 23 for Qwen 3.5 2B)
-START_LAYER=${1:-0}
-END_LAYER=${2:-23}
-
-NUM_GPUS=8
-
-# Project Paths
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
 
-INPUT_DIR="${PROJECT_ROOT}/data_100M/train"
-FEATURES_DIR="${PROJECT_ROOT}/qwen3.5_2B_features_cache"
-CHECKPOINTS_DIR="${PROJECT_ROOT}/qwen3.5_2B_checkpoints_layers"
+# Prevent file descriptor exhaustion across DDP workers & memmaps
+ulimit -n 65536
+
+# ------------------------------------------------------------------------------
+# 1. Configurable Variables
+# ------------------------------------------------------------------------------
+NUM_GPUS=8
+PYTHON_SCRIPT="${PROJECT_ROOT}/train_stage_1.py"
+
+# Path Directories
+DATA_CACHE_DIR="${PROJECT_ROOT}/data_20B/train"
+OUTPUT_DIR="${PROJECT_ROOT}/qwen3.5_2B_20BT_clm_checkpoints"
 TEACHER_MODEL="Qwen/Qwen3.5-2B"
-TOTAL_TOKENS="100000000"
+LAYER_SEQUENCE="cs_lrad,cs_lrad,cs_lrad,transformer"
 
-# Model Dimensions (Qwen 3.5 2B)
+# Structural Dimensions (Matching Qwen 3.5 2B with Deep Rank-16 State Tracking)
 D_MODEL=2048
+NUM_LAYERS=24
 NUM_HEADS=16
+CHUNK_SIZE=32
+RANK=16
+SEQ_LEN=2048
 
-# Extraction Parameters
-EXTRACT_BATCH_SIZE=64
+# Hyperparameters (20 Billion Unique Tokens @ Effective Batch Size 128)
+# Global Step Size = 8 GPUs * 4 per-device batch * 4 grad accum * 2048 seq_len = 262,144 tokens/step
+# Total Steps for 20B Tokens = 20,000,000,000 / 262,144 ≈ 76,292 steps
+# Phase 1 Steps (20% = 4B Tokens) = 4,000,000,000 / 262,144 ≈ 15,258 steps
+# Phase 2 Steps (80% = 16B Tokens) = 76,292 - 15,258 = 61,034 steps
+MAX_STEPS=76292
+PHASE1_STEPS=15258
+WARMUP_STEPS=3800
+WEIGHT_DECAY="0.01"
 
-# Training Parameters (100M Tokens)
-TRAIN_BATCH_SIZE=128
-GRAD_ACCUM=1
-LEARNING_RATE="1e-3"
-MAX_STEPS=100         # 1 full epoch over 100M tokens @ batch_size 64
-WARMUP_STEPS=10       # ~10% warmup
-SAVE_STEPS=50        # Mid-point checkpoint
-LOGGING_STEPS=10      # Step logging interval
+# Differential Learning Rates
+LEARNING_RATE="2.5e-4"       # Base Peak LR for CS-LRAD mixer layers
+BACKBONE_LR_RATIO="0.08"     # 0.08 * 2.5e-4 = 2.0e-5 for MLPs & Native Attention
+EMB_LR_RATIO="0.02"          # 0.02 * 2.5e-4 = 5.0e-6 for Embeddings & LM Head
+
+# Hardware Allocation (Effective Batch Size = 8 GPUs * 4 batch * 4 accum = 128)
+BATCH_SIZE=4
+GRAD_ACCUM=4
+
+# Checkpoint & Eval Frequency (Every ~262M Tokens)
+LOGGING_STEPS=50
+SAVE_STEPS=1000
+EVAL_STEPS=1000
 
 # Cloudflare R2 Sync Settings
-ENABLE_R2_SYNC=${ENABLE_R2_SYNC:-true}
-R2_BUCKET=${R2_BUCKET:-"baretorch-data"}
-R2_PREFIX=${R2_PREFIX:-"qwen3.5_2B_checkpoints_layers"}
+ENABLE_R2_SYNC=true
+R2_BUCKET="baretorch-data"
+R2_PREFIX="qwen3.5_2B_20BT_clm_checkpoints"
+
+# ------------------------------------------------------------------------------
+# 2. Environment Variables & Hardware Optimizations
+# ------------------------------------------------------------------------------
+export OMP_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+# ------------------------------------------------------------------------------
+# 3. Pre-Flight Checks & Environment Validation
+# ------------------------------------------------------------------------------
+echo "=================================================================="
+echo "🚀 Initializing BareTorch 20BT End-to-End Distillation (8x H100)"
+echo "=================================================================="
+echo "Target Python Script   : ${PYTHON_SCRIPT}"
+echo "Number of GPUs         : ${NUM_GPUS}x H100 SXM5"
+echo "Teacher Model          : ${TEACHER_MODEL}"
+echo "Model Dimensions       : d_model=${D_MODEL}, num_layers=${NUM_LAYERS}, num_heads=${NUM_HEADS}"
+echo "CS-LRAD Configuration  : rank=${RANK}, chunk_size=${CHUNK_SIZE}, seq_len=${SEQ_LEN}"
+echo "Dataset Directory      : ${DATA_CACHE_DIR} (20BT Unique Stream)"
+echo "Output Directory       : ${OUTPUT_DIR}"
+echo "Tokens per Step        : $(( BATCH_SIZE * GRAD_ACCUM * NUM_GPUS * SEQ_LEN )) (262,144 tokens/step)"
+echo "Total Training Steps   : ${MAX_STEPS} (20 Billion Unique Tokens)"
+echo "Phase 1 Steps (CS-LRAD): 0 to ${PHASE1_STEPS} (4 Billion Tokens, Backbone Frozen)"
+echo "Phase 2 Steps (Global) : ${PHASE1_STEPS} to ${MAX_STEPS} (16 Billion Tokens, Co-Adaptation)"
+echo "Base Peak LR (CS-LRAD) : ${LEARNING_RATE}"
+echo "Backbone Peak LR       : 2.0e-5 (Ratio: ${BACKBONE_LR_RATIO})"
+echo "Embeddings Peak LR     : 5.0e-6 (Ratio: ${EMB_LR_RATIO})"
+echo "Cloudflare R2 Sync     : ${ENABLE_R2_SYNC}"
+echo "=================================================================="
+
+if [ ! -d "${DATA_CACHE_DIR}" ]; then
+    echo "❌ ERROR: Dataset cache directory '${DATA_CACHE_DIR}' does not exist!"
+    exit 1
+fi
+
+mkdir -p "${OUTPUT_DIR}"
+
+sync
+sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
+
+# ------------------------------------------------------------------------------
+# 4. Launch Execution
+# ------------------------------------------------------------------------------
+echo -e "\n🔥 Launching torchrun across ${NUM_GPUS} GPUs...\n"
+
+R2_FLAG=""
+if [ "${ENABLE_R2_SYNC}" = true ]; then
+    R2_FLAG="--r2_sync"
+fi
+
+torchrun --nproc_per_node="${NUM_GPUS}" "${PYTHON_SCRIPT}" \
+    --data_cache_dir "${DATA_CACHE_DIR}" \
+    --output_dir "${OUTPUT_DIR}" \
+    --teacher_model_name "${TEACHER_MODEL}" \
+    --layer_sequence "${LAYER_SEQUENCE}" \
+    --d_model "${D_MODEL}" \
+    --num_layers "${NUM_LAYERS}" \
+    --num_heads "${NUM_HEADS}" \
+    --chunk_size "${CHUNK_SIZE}" \
+    --rank "${RANK}" \
+    --seq_len "${SEQ_LEN}" \
+    --max_steps "${MAX_STEPS}" \
+    --phase1_steps "${PHASE1_STEPS}" \
+    --learning_rate "${LEARNING_RATE}" \
+    --backbone_lr_ratio "${BACKBONE_LR_RATIO}" \
+    --emb_lr_ratio "${EMB_LR_RATIO}" \
+    --warmup_steps "${WARMUP_STEPS}" \
+    --weight_decay "${WEIGHT_DECAY}" \
+    --batch_size "${BATCH_SIZE}" \
+    --grad_accum "${GRAD_ACCUM}" \
+    --logging_steps "${LOGGING_STEPS}" \
+    --save_steps "${SAVE_STEPS}" \
+    --eval_steps "${EVAL_STEPS}" \
+    --r2_bucket "${R2_BUCKET}" \
+    --r2_prefix "${R2_PREFIX}" \
+    --compile \
+    ${R2_FLAG}
 
 echo "=================================================================="
-echo "🚀 Starting 3:1 Hybrid Layerwise Distillation Stage 2 (24 Layers)"
-echo "=================================================================="
-echo "Project Root       : ${PROJECT_ROOT}"
-echo "Number of GPUs     : ${NUM_GPUS}x H100"
-echo "Target Layers      : ${START_LAYER} through ${END_LAYER}"
-echo "Pattern            : 3 CS-LRAD layers -> 1 Transformer layer"
-echo "Teacher Model      : ${TEACHER_MODEL}"
-echo "Input Dataset      : ${INPUT_DIR}"
-echo "Features Cache     : ${FEATURES_DIR}"
-echo "Checkpoints Dir    : ${CHECKPOINTS_DIR}"
-echo "Cloudflare R2 Sync : ${ENABLE_R2_SYNC}"
-echo "=================================================================="
-
-for (( LAYER=START_LAYER; LAYER<=END_LAYER; LAYER++ )); do
-    FINAL_WEIGHT_PATH="${CHECKPOINTS_DIR}/layer_${LAYER}/cs_lrad_layer_${LAYER}.pt"
-    LAYER_OUTPUT_DIR="${CHECKPOINTS_DIR}/layer_${LAYER}"
-
-    echo ""
-    echo "=================================================================="
-    echo "⚡ PROCESSING LAYER ${LAYER} / ${END_LAYER}"
-    echo "=================================================================="
-
-    # Check if Layer is already processed
-    if [ -f "$FINAL_WEIGHT_PATH" ]; then
-        echo "⏭️  Layer ${LAYER} weights already exist at '${FINAL_WEIGHT_PATH}'."
-        echo "   Skipping Layer ${LAYER}."
-        continue
-    fi
-
-    # Check if this layer is a standard Transformer layer (indices 3, 7, 11, 15, 19, 23)
-    if [ $(( (LAYER + 1) % 4 )) -eq 0 ]; then
-        echo "🔄 Layer ${LAYER} is a standard TRANSFORMER block in the 3:1 hybrid design."
-        echo "   Copying Qwen Teacher Layer ${LAYER} weights directly (skipping distillation training)..."
-
-        mkdir -p "$LAYER_OUTPUT_DIR"
-        
-        python3 -c "
-import torch
-from transformers import AutoModelForCausalLM
-
-model = AutoModelForCausalLM.from_pretrained('${TEACHER_MODEL}', torch_dtype=torch.bfloat16, trust_remote_code=True)
-layer_weights = model.model.layers[${LAYER}].state_dict()
-torch.save(layer_weights, '${FINAL_WEIGHT_PATH}')
-print('   ✅ Saved Qwen Transformer weights for Layer ${LAYER}')
-"
-        if [ "${ENABLE_R2_SYNC}" = true ]; then
-            echo "📤 Syncing Layer ${LAYER} Transformer weights to Cloudflare R2..."
-            rclone copy "${LAYER_OUTPUT_DIR}" "r2:${R2_BUCKET}/${R2_PREFIX}/layer_${LAYER}" --transfers 8 --s3-chunk-size 64M || true
-        fi
-
-        echo "🎉 LAYER ${LAYER} (TRANSFORMER) PROCESSED!"
-        continue
-    fi
-
-    # ------------------------------------------------------------------
-    # Step 1: Feature Extraction for CS-LRAD Layer
-    # ------------------------------------------------------------------
-    echo "📥 Step 1/2: Extracting hidden states for CS-LRAD Layer ${LAYER} across ${NUM_GPUS} GPUs..."
-    
-    torchrun --nproc_per_node="${NUM_GPUS}" "${PROJECT_ROOT}/hidden_states_extraction.py" \
-        --input_dir "${INPUT_DIR}" \
-        --output_dir "${FEATURES_DIR}" \
-        --checkpoints_dir "${CHECKPOINTS_DIR}" \
-        --target_layer "${LAYER}" \
-        --teacher_model_name "${TEACHER_MODEL}" \
-        --total_tokens "${TOTAL_TOKENS}" \
-        --attn_implementation sdpa \
-        --batch_size "${EXTRACT_BATCH_SIZE}"
-
-    echo "✅ Feature extraction complete for Layer ${LAYER}."
-
-    # ------------------------------------------------------------------
-    # Step 2: Single-Layer Feature Matching Training
-    # ------------------------------------------------------------------
-    echo "🏋 Step 2/2: Training CS-LRAD Layer ${LAYER} across ${NUM_GPUS} GPUs..."
-
-    R2_FLAG=""
-    if [ "${ENABLE_R2_SYNC}" = true ]; then
-        R2_FLAG="--r2_sync"
-    fi
-
-    torchrun --nproc_per_node="${NUM_GPUS}" "${PROJECT_ROOT}/train_stage_1.py" \
-        --target_layer "${LAYER}" \
-        --features_dir "${FEATURES_DIR}" \
-        --output_dir "${CHECKPOINTS_DIR}" \
-        --teacher_model_name "${TEACHER_MODEL}" \
-        --d_model "${D_MODEL}" \
-        --num_heads "${NUM_HEADS}" \
-        --batch_size "${TRAIN_BATCH_SIZE}" \
-        --grad_accum "${GRAD_ACCUM}" \
-        --learning_rate "${LEARNING_RATE}" \
-        --warmup_steps "${WARMUP_STEPS}" \
-        --max_steps "${MAX_STEPS}" \
-        --save_steps "${SAVE_STEPS}" \
-        --logging_steps "${LOGGING_STEPS}" \
-        --r2_bucket "${R2_BUCKET}" \
-        --r2_prefix "${R2_PREFIX}" \
-        ${R2_FLAG}
-
-    echo "✅ Training complete for Layer ${LAYER}."
-
-    # ------------------------------------------------------------------
-    # Step 3: Disk Space & System RAM Cache Cleanup
-    # ------------------------------------------------------------------
-    echo "🧹 Reclaiming disk space and purging host RAM cache for Layer ${LAYER}..."
-    rm -rf "${FEATURES_DIR}/layer_${LAYER}"
-    sync  # Flush pending write operations to NVMe
-    
-    sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
-    
-    echo "   Reclaimed disk space and freed host RAM for Layer ${LAYER}."
-    echo "🎉 LAYER ${LAYER} (CS-LRAD) DISTILLATION COMPLETE!"
-done
-
-echo ""
-echo "=================================================================="
-echo "🏆 STAGE 2 LAYERWISE DISTILLATION COMPLETE FOR ALL 24 LAYERS (${START_LAYER}..${END_LAYER})!"
+echo "🎉 20BT END-TO-END DISTILLATION COMPLETE!"
+echo "   Consolidated model weights and tokenizer saved to '${OUTPUT_DIR}'"
 echo "=================================================================="

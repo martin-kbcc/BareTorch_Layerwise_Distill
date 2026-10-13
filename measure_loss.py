@@ -133,7 +133,7 @@ def main():
     parser.add_argument(
         "--student_checkpoint",
         type=str,
-        default=os.path.join(PROJECT_ROOT, "qwen3.5_0.8B_clm_checkpoints", "checkpoint-9000"),
+        default=os.path.join(PROJECT_ROOT, "qwen3.5_0.8B_clm_checkpoints", "checkpoint-15258"),
     )
     parser.add_argument(
         "--data_cache_dir",
