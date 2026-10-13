@@ -24,7 +24,7 @@ PYTHON_SCRIPT="${PROJECT_ROOT}/train_stage_1.py"
 
 # Path Directories
 DATA_CACHE_DIR="${PROJECT_ROOT}/data_1B/train"
-OUTPUT_DIR="${PROJECT_ROOT}/qwen3.5_0.8B_clm_checkpoints"
+OUTPUT_DIR="${PROJECT_ROOT}/qwen3.5_0.8B_clm_checkpoints_lr7.5e-4"
 TEACHER_MODEL="Qwen/Qwen3.5-0.8B"
 LAYER_SEQUENCE="cs_lrad,cs_lrad,cs_lrad,transformer"
 
@@ -51,9 +51,9 @@ WARMUP_STEPS=150
 WEIGHT_DECAY="0.01"
 
 # Differential Learning Rates (Baseline Settings for Sweep)
-LEARNING_RATE="5e-4"       # Base LR for CS-LRAD mixer layers
-BACKBONE_LR_RATIO="0.1"     # 0.1 * 5e-4 = 5.0e-5 for MLPs & Attention
-EMB_LR_RATIO="0.02"          # 0.02 * 5e-4 = 1.0e-5 for Embeddings & LM Head
+LEARNING_RATE="7.5e-4"       # Base LR for CS-LRAD mixer layers
+BACKBONE_LR_RATIO="0.1"     # 0.1 * 7.5e-4 = 7.5e-5 for MLPs & Attention
+EMB_LR_RATIO="0.02"          # 0.02 * 7.5e-4 = 1.5e-5 for Embeddings & LM Head
 
 # Checkpoint & Eval Frequency (Scaled for 1,908 total steps to monitor loss curve)
 LOGGING_STEPS=25
