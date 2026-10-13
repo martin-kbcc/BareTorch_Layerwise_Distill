@@ -58,7 +58,7 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         self.W_out = nn.Linear(self.inner_dim, d_model, bias=False)
         self.resid_drop = nn.Dropout(dropout)
 
-    def forward(self, x, attention_mask=None):
+    def chunk_forward(self, x, attention_mask=None, use_cache=False):
         B, L, D = x.shape
         H, C, d_h, r = self.num_heads, self.chunk_size, self.d_head, self.r
         scaling = 1.0 / math.sqrt(d_h)
@@ -143,17 +143,47 @@ class LowRankAssociativeDeltaEngine(nn.Module):
 
         output = self.resid_drop(self.W_out(Out * F.silu(self.W_swish_gate(x))))
 
-        chunk_decay_last = exp_Lambda[:, :, -1, -1:, :]
-        S_historical_last = S_historical[:, :, -1]
-        S_local_last = torch.matmul(U_decayed[:, :, -1].transpose(-1, -2), V_fp32[:, :, -1])
-        S_final = (chunk_decay_last * S_historical_last) + S_local_last
-        S_final = torch.clamp(S_final, min=-50.0, max=50.0).to(dtype=x.dtype)
+        next_cache = None
+        if use_cache:
+            chunk_decay_last = exp_Lambda[:, :, -1, -1:, :]
+            S_historical_last = S_historical[:, :, -1]
+            S_local_last = torch.matmul(U_decayed[:, :, -1].transpose(-1, -2), V_fp32[:, :, -1])
+            S_final = (chunk_decay_last * S_historical_last) + S_local_last
+            S_final = torch.clamp(S_final, min=-50.0, max=50.0)
+            next_cache = (S_final, None, None, None, None, L)
 
-        return output, S_final
+        return output, next_cache
 
-    def step_inference(self, x, past_S=None, attention_mask=None):
+    def step_forward(self, x, past_state=None, use_cache=True, attention_mask=None):
         B, L, D = x.shape
-        H, d_h, r = self.num_heads, self.d_head, self.r
+        H, C, d_h, r = self.num_heads, self.chunk_size, self.d_head, self.r
+        scaling = 1.0 / math.sqrt(d_h)
+
+        past_S = None
+        buf_k = None
+        buf_v = None
+        buf_u = None
+        buf_lambda = None
+        curr_seq_len = 0
+
+        if past_state is not None:
+            if isinstance(past_state, (tuple, list)):
+                if len(past_state) >= 1 and isinstance(past_state[0], torch.Tensor):
+                    past_S = past_state[0]
+                if len(past_state) >= 5:
+                    buf_k, buf_v, buf_u, buf_lambda = past_state[1], past_state[2], past_state[3], past_state[4]
+                if len(past_state) >= 6 and isinstance(past_state[5], int):
+                    curr_seq_len = past_state[5]
+            elif isinstance(past_state, torch.Tensor):
+                past_S = past_state
+
+        if past_S is None:
+            past_S = torch.zeros(B, H, r, d_h, device=x.device, dtype=torch.float32)
+        else:
+            past_S = past_S.float()
+
+        if L > 1:
+            return self.chunk_forward(x, attention_mask=attention_mask, use_cache=use_cache)
 
         Q = F.silu(self.W_q(x).view(B, L, H, d_h).permute(0, 2, 1, 3))
         K = F.silu(self.W_k(x).view(B, L, H, d_h).permute(0, 2, 1, 3))
@@ -167,34 +197,53 @@ class LowRankAssociativeDeltaEngine(nn.Module):
             max=0.9999,
         )
         beta_gate = torch.sigmoid(self.W_beta_gate(x).float()).view(B, L, H).permute(0, 2, 1).unsqueeze(-1)
+        log_gate = torch.log(gate)
 
-        if attention_mask is not None:
-            if attention_mask.dim() == 2 and attention_mask.size(1) != L:
-                attn_mask_curr = attention_mask[:, -L:]
-            else:
-                attn_mask_curr = attention_mask
-            mask = attn_mask_curr.view(B, 1, L, 1).to(dtype=torch.float32, device=x.device)
-            U_fp32 = U.float() * mask
-            V_fp32 = V.float() * mask
-            gate = torch.where(mask.bool(), gate, torch.ones_like(gate))
+        if buf_lambda is not None:
+            last_lambda = buf_lambda[:, :, -1:, :]
+            lambda_curr = last_lambda + log_gate
+            all_lambda = torch.cat([buf_lambda, lambda_curr], dim=2)
+            all_k = torch.cat([buf_k, K.float()], dim=2)
+            all_v = torch.cat([buf_v, V.float()], dim=2)
+            all_u = torch.cat([buf_u, (U.float() * beta_gate)], dim=2)
         else:
-            U_fp32 = U.float()
-            V_fp32 = V.float()
+            lambda_curr = log_gate
+            all_lambda = lambda_curr
+            all_k = K.float()
+            all_v = V.float()
+            all_u = U.float() * beta_gate
 
-        if past_S is None or not isinstance(past_S, torch.Tensor):
-            past_S = torch.zeros(B, H, r, d_h, device=x.device, dtype=torch.float32)
-        else:
-            past_S = past_S.float()
+        exp_lambda_curr = torch.exp(torch.clamp(lambda_curr, min=-30.0, max=0.0))
 
-        Y_global = torch.matmul(R.float(), past_S) * (1.0 / math.sqrt(d_h))
-        Y_local = torch.matmul(Q.float(), torch.matmul(K.float().transpose(-1, -2), V_fp32)) * (1.0 / math.sqrt(d_h))
+        diff = lambda_curr - all_lambda.transpose(-1, -2)
+        m_links = torch.exp(torch.clamp(diff, max=0.0))
+        attn_weights = torch.matmul(Q.float(), all_k.transpose(-1, -2)) * scaling * m_links
+        Y_local = torch.matmul(attn_weights, all_v)
 
-        S_state = (gate * past_S) + torch.matmul((U_fp32 * beta_gate).transpose(-1, -2), V_fp32)
-        S_state = torch.clamp(S_state, min=-50.0, max=50.0)
+        Y_global = torch.matmul(R.float() * exp_lambda_curr, past_S) * scaling
 
-        Out = (Y_local + Y_global).permute(0, 2, 1, 3).contiguous().view(B, L, D).to(dtype=x.dtype)
+        Out = (Y_local + Y_global).permute(0, 2, 1, 3).contiguous().view(B, 1, self.inner_dim).to(dtype=x.dtype)
         output = self.resid_drop(self.W_out(Out * F.silu(self.W_swish_gate(x))))
-        return output, S_state.to(dtype=x.dtype)
+
+        curr_c = all_k.size(2)
+        if curr_c >= C:
+            chunk_decay = torch.exp(torch.clamp(all_lambda[:, :, -1:, :], min=-30.0, max=0.0))
+            intra_decay = torch.exp(torch.clamp(all_lambda[:, :, -1:, :] - all_lambda, min=-30.0, max=0.0))
+            u_decayed = all_u * intra_decay
+            s_local = torch.matmul(u_decayed.transpose(-1, -2), all_v)
+            past_S = torch.clamp((chunk_decay * past_S) + s_local, min=-50.0, max=50.0)
+
+            buf_k, buf_v, buf_u, buf_lambda = None, None, None, None
+        else:
+            buf_k, buf_v, buf_u, buf_lambda = all_k, all_v, all_u, all_lambda
+
+        next_cache = (past_S, buf_k, buf_v, buf_u, buf_lambda, curr_seq_len + 1)
+        return output, next_cache
+
+    def forward(self, x, past_state=None, use_cache=False, attention_mask=None):
+        if past_state is not None or (x.size(1) == 1 and use_cache):
+            return self.step_forward(x, past_state=past_state, use_cache=use_cache, attention_mask=attention_mask)
+        return self.chunk_forward(x, attention_mask=attention_mask, use_cache=use_cache)
 
 
 class LRADDecoderBlock(nn.Module):
@@ -208,22 +257,12 @@ class LRADDecoderBlock(nn.Module):
 
     def forward(self, x, past_state=None, use_cache=False, attention_mask=None):
         h_attn = self.ln1(x)
-        B, L, _ = x.shape
-
-        if isinstance(past_state, tuple) and len(past_state) > 0:
-            past_state = past_state[0]
-
-        is_step_inference = (past_state is not None) or (L == 1)
-
-        if is_step_inference:
-            attn_out, next_state = self.attn.step_inference(h_attn, past_S=past_state, attention_mask=attention_mask)
-        else:
-            attn_out, next_state = self.attn(h_attn, attention_mask=attention_mask)
+        attn_out, next_state = self.attn(h_attn, past_state=past_state, use_cache=use_cache, attention_mask=attention_mask)
 
         x_out = x + attn_out
         x_out = x_out + self.mlp(self.ln2(x_out))
 
-        cache_out = (next_state, next_state) if use_cache else None
+        cache_out = next_state if use_cache else None
         return x_out, cache_out
 
 
@@ -422,8 +461,6 @@ class CSLRADForCausalLM(CSLRADPreTrainedModel):
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-
-        # Logit Soft-Capping (30.0 * tanh(logits / 30.0))
         logits = 30.0 * torch.tanh(logits / 30.0)
 
         loss = None
@@ -456,10 +493,14 @@ class CSLRADForCausalLM(CSLRADPreTrainedModel):
         }
 
     def _reorder_cache(self, past_key_values, beam_idx):
-        reordered_past = ()
-        for layer_past in past_key_values:
-            if layer_past is None:
-                reordered_past += (None,)
-            else:
-                reordered_past += (layer_past.index_select(0, beam_idx),)
-        return reordered_past
+        if past_key_values is None:
+            return None
+
+        def _reorder_item(item):
+            if isinstance(item, torch.Tensor):
+                return item.index_select(0, beam_idx)
+            elif isinstance(item, (tuple, list)):
+                return tuple(_reorder_item(x) for x in item)
+            return item
+
+        return tuple(_reorder_item(layer_past) for layer_past in past_key_values)

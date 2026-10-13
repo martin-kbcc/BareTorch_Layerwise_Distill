@@ -28,13 +28,9 @@ class BareTorchPreTrainedModel(PreTrainedModel):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def _set_gradient_checkpointing(self, enable=True, gradient_checkpointing_func=None, *args, **kwargs):
-        """
-        Flexible gradient checkpointing setter accepting arbitrary Hugging Face kwargs
-        (e.g., every_n_layers, value) across transformers version updates.
-        """
         if "value" in kwargs:
             enable = kwargs.pop("value")
-            
+
         if gradient_checkpointing_func is None:
             gradient_checkpointing_func = partial(checkpoint.checkpoint, use_reentrant=False)
 
@@ -64,7 +60,7 @@ class BareTorchModel(BareTorchPreTrainedModel):
         self._gradient_checkpointing_func = partial(checkpoint.checkpoint, use_reentrant=False)
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.drop = nn.Dropout(config.dropout)
-        self.rotary_emb = None  # Populated from teacher during model assembly
+        self.rotary_emb = None
 
         self.layers = nn.ModuleList()
         for i in range(config.num_layers):
@@ -124,7 +120,7 @@ class BareTorchModel(BareTorchPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.token_embedding(input_ids)
 
-        if past_key_values is not None and inputs_embeds.size(1) > 1:
+        if past_key_values is not None and inputs_embeds.size(1) > 1 and not self.training:
             inputs_embeds = inputs_embeds[:, -1:, :]
             batch_size, seq_length, _ = inputs_embeds.shape
 
@@ -135,13 +131,29 @@ class BareTorchModel(BareTorchPreTrainedModel):
             past_length = 0
             if past_key_values is not None:
                 for idx, layer_past in enumerate(past_key_values):
-                    if isinstance(layer_past, tuple) and len(layer_past) > 0 and layer_past[0] is not None:
-                        p_item = layer_past[0]
-                        while isinstance(p_item, (tuple, list)) and len(p_item) > 0:
-                            p_item = p_item[0]
-                        if isinstance(p_item, torch.Tensor):
-                            past_length = p_item.size(-2)
+                    l_type = (
+                        self.config.layer_types[idx]
+                        if (hasattr(self.config, "layer_types") and idx < len(self.config.layer_types))
+                        else None
+                    )
+                    if (
+                        l_type == "transformer"
+                        and layer_past is not None
+                        and isinstance(layer_past, (tuple, list))
+                        and len(layer_past) > 0
+                    ):
+                        k_tensor = layer_past[0]
+                        if isinstance(k_tensor, torch.Tensor) and k_tensor.dim() >= 3:
+                            past_length = k_tensor.size(-2)
                             break
+                else:
+                    if attention_mask is not None and attention_mask.size(1) > seq_length:
+                        past_length = attention_mask.size(1) - seq_length
+                    else:
+                        for layer_past in past_key_values:
+                            if isinstance(layer_past, (tuple, list)) and len(layer_past) >= 6 and isinstance(layer_past[5], int):
+                                past_length = layer_past[5]
+                                break
 
             if attention_mask is not None and past_length == 0:
                 position_ids = (torch.cumsum(attention_mask, dim=-1) - 1).clamp(min=0)
@@ -182,7 +194,6 @@ class BareTorchModel(BareTorchPreTrainedModel):
             elif isinstance(layer, nn.Identity) or cls_name == "identity":
                 next_state = None
             else:
-                # Native Teacher Transformer Layer (Qwen Decoder Layer)
                 if is_gc:
                     def create_qwen_forward(module, attn_mask, pos_ids, p_kv, u_cache, pos_embeds):
                         def qwen_forward(x_in):
@@ -348,8 +359,10 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
             input_ids = input_ids[:, -1:]
 
         cache_position = kwargs.get("cache_position", None)
-        if cache_position is not None and past_key_values is not None:
+        if cache_position is not None:
             position_ids = cache_position[-1:].unsqueeze(0) if cache_position.dim() == 1 else cache_position
+        elif attention_mask is not None and past_key_values is not None:
+            position_ids = (attention_mask.sum(dim=-1, keepdim=True) - 1).clamp(min=0)
 
         if position_ids is not None:
             position_ids = position_ids.to(input_ids.device)
@@ -366,23 +379,15 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         if past_key_values is None:
             return None
 
-        reordered_past = ()
-        for layer_past in past_key_values:
-            if layer_past is None:
-                reordered_past += (None,)
-            elif isinstance(layer_past, tuple):
-                k, v = layer_past
-                reordered_past += ((k.index_select(0, beam_idx), v.index_select(0, beam_idx)),)
-            elif isinstance(layer_past, torch.Tensor):
-                reordered_past += (layer_past.index_select(0, beam_idx),)
-            else:
-                reordered_past += (layer_past,)
-        return reordered_past
+        def _reorder_item(item):
+            if isinstance(item, torch.Tensor):
+                return item.index_select(0, beam_idx)
+            elif isinstance(item, (tuple, list)):
+                return tuple(_reorder_item(x) for x in item)
+            return item
 
+        return tuple(_reorder_item(layer_past) for layer_past in past_key_values)
 
-# ==========================================
-# Hugging Face Global Model Registration
-# ==========================================
 
 AutoModel.register(BareTorchConfig, BareTorchModel)
 AutoModelForCausalLM.register(BareTorchConfig, BareTorchForCausalLM)

@@ -1,4 +1,4 @@
-# /home/martinkb/Desktop/BareTorch_Layerwise_Distill/train_stage_2.py
+# /home/martinkb/Desktop/BareTorch_Layerwise_Distill/train_stage_1.py
 import argparse
 import gc
 import glob
@@ -154,40 +154,43 @@ class R2CheckpointCallback(TrainerCallback):
 
 
 # ==================================================================
-# 3. Direct Model Surgery & Warm-Start Initializer (No Stage 1 Files)
+# 3. Direct Model Surgery & Warm-Start Initializer
 # ==================================================================
 
 
 def safe_copy_linear(target_module, target_attr, source_linear):
-    """Safely copies linear layer weights and biases, handling shape alignment."""
+    """Safely copies linear layer weights and biases, handling shape alignment and device placement."""
     target_layer = getattr(target_module, target_attr, None)
     if target_layer is None or source_linear is None:
         return
 
     source_weight = source_linear.weight
     has_bias = source_linear.bias is not None
+    target_device = target_layer.weight.device
+    target_dtype = target_layer.weight.dtype
 
     if target_layer.weight.shape != source_weight.shape:
         new_linear = nn.Linear(
             source_linear.in_features,
             source_linear.out_features,
             bias=has_bias,
-            device=source_weight.device,
-            dtype=source_weight.dtype,
+            device=target_device,
+            dtype=target_dtype,
         )
         setattr(target_module, target_attr, new_linear)
         target_layer = new_linear
 
     with torch.no_grad():
-        target_layer.weight.copy_(source_weight)
+        target_layer.weight.copy_(source_weight.to(device=target_device, dtype=target_dtype))
         if has_bias and target_layer.bias is not None:
-            target_layer.bias.copy_(source_linear.bias)
+            source_bias = source_linear.bias.to(device=target_device, dtype=target_dtype)
+            target_layer.bias.copy_(source_bias)
 
 
 def warm_start_cslrad_layer(teacher_layer, student_block: LRADDecoderBlock, rank=8):
     """
     Transfers matching projections from teacher layer to LRADDecoderBlock.
-    Applies mathematically correct SVD projection (U * sqrt(S) and V * sqrt(S)).
+    Applies per-head SVD projection factoring W_q^T * W_k and handles GQA head expansion.
     """
     with torch.no_grad():
         # 1. Copy RMSNorms
@@ -202,43 +205,95 @@ def warm_start_cslrad_layer(teacher_layer, student_block: LRADDecoderBlock, rank
             safe_copy_linear(student_block.mlp, "w2", teacher_layer.mlp.up_proj)
             safe_copy_linear(student_block.mlp, "w3", teacher_layer.mlp.down_proj)
 
-        # 3. Copy Attention Projections
+        # 3. Copy Attention Projections with GQA Broadcast Support
         if hasattr(student_block, "attn") and hasattr(teacher_layer, "self_attn"):
             safe_copy_linear(student_block.attn, "W_q", teacher_layer.self_attn.q_proj)
-            safe_copy_linear(student_block.attn, "W_k", teacher_layer.self_attn.k_proj)
-            safe_copy_linear(student_block.attn, "W_v", teacher_layer.self_attn.v_proj)
             safe_copy_linear(student_block.attn, "W_out", teacher_layer.self_attn.o_proj)
 
             if hasattr(student_block.attn, "W_swish_gate"):
                 safe_copy_linear(student_block.attn, "W_swish_gate", teacher_layer.self_attn.q_proj)
 
-            # 4. Truncated SVD for W_u and W_r factoring W_k^T * W_v
-            W_k = teacher_layer.self_attn.k_proj.weight.float()
-            W_v = teacher_layer.self_attn.v_proj.weight.float()
-            prod = torch.matmul(W_k.T, W_v)
+            q_linear = teacher_layer.self_attn.q_proj
+            k_linear = teacher_layer.self_attn.k_proj
+            v_linear = teacher_layer.self_attn.v_proj
 
-            U, S, V = torch.svd(prod)
-            sqrt_s = torch.sqrt(torch.clamp(S[:rank], min=1e-8))
-
-            svd_u = (U[:, :rank] * sqrt_s).T.to(torch.bfloat16)
-            svd_r = (V[:, :rank] * sqrt_s).T.to(torch.bfloat16)
+            q_out = q_linear.weight.shape[0]
+            k_weight = k_linear.weight
+            v_weight = v_linear.weight
 
             d_model = student_block.attn.d_model
             num_heads = student_block.attn.num_heads
+            d_head = student_block.attn.d_head
 
-            svd_u_tiled = svd_u.repeat(num_heads, 1)[: num_heads * rank, :d_model]
-            svd_r_tiled = svd_r.repeat(num_heads, 1)[: num_heads * rank, :d_model]
+            if k_weight.shape[0] < q_out:
+                num_kv_heads = k_weight.shape[0] // d_head
+                rep = num_heads // num_kv_heads
+                k_expanded = (
+                    k_weight.view(num_kv_heads, d_head, d_model)
+                    .repeat_interleave(rep, dim=0)
+                    .view(num_heads * d_head, d_model)
+                )
+                v_expanded = (
+                    v_weight.view(num_kv_heads, d_head, d_model)
+                    .repeat_interleave(rep, dim=0)
+                    .view(num_heads * d_head, d_model)
+                )
+            else:
+                k_expanded = k_weight
+                v_expanded = v_weight
 
-            if student_block.attn.W_u.weight.shape != svd_u_tiled.shape:
+            student_block.attn.W_k.weight.copy_(
+                k_expanded.to(device=student_block.attn.W_k.weight.device, dtype=student_block.attn.W_k.weight.dtype)
+            )
+            student_block.attn.W_v.weight.copy_(
+                v_expanded.to(device=student_block.attn.W_v.weight.device, dtype=student_block.attn.W_v.weight.dtype)
+            )
+
+            # 4. Truncated Head-Wise SVD factoring W_q^T * W_k (Query-Key routing interaction)
+            W_q = q_linear.weight.float()
+            W_k = k_expanded.float()
+
+            W_q_heads = W_q.view(num_heads, d_head, d_model)
+            W_k_heads = W_k.view(num_heads, d_head, d_model)
+
+            u_list = []
+            r_list = []
+
+            for h in range(num_heads):
+                W_q_h = W_q_heads[h]  # (d_head, d_model)
+                W_k_h = W_k_heads[h]  # (d_head, d_model)
+
+                # Interaction matrix: (d_model, d_head) @ (d_head, d_model) = (d_model, d_model)
+                P_h = torch.matmul(W_q_h.T, W_k_h)
+
+                try:
+                    U_h, S_h, Vh_h = torch.linalg.svd(P_h, full_matrices=False)
+                except Exception:
+                    U_h, S_h, V_temp = torch.svd(P_h)
+                    Vh_h = V_temp.T
+
+                sqrt_s = torch.sqrt(torch.clamp(S_h[:rank], min=1e-8))
+
+                # W_r factors Query routing, W_u factors Key routing
+                W_r_head = (U_h[:, :rank] * sqrt_s).T.to(student_block.attn.W_r.weight.dtype)
+                W_u_head = (sqrt_s.unsqueeze(-1) * Vh_h[:rank, :]).to(student_block.attn.W_u.weight.dtype)
+
+                r_list.append(W_r_head)
+                u_list.append(W_u_head)
+
+            svd_r_weights = torch.cat(r_list, dim=0)  # (num_heads * rank, d_model)
+            svd_u_weights = torch.cat(u_list, dim=0)  # (num_heads * rank, d_model)
+
+            if student_block.attn.W_u.weight.shape != svd_u_weights.shape:
                 student_block.attn.W_u = nn.Linear(
-                    d_model, num_heads * rank, bias=False, device=W_k.device, dtype=torch.bfloat16
+                    d_model, num_heads * rank, bias=False, device=student_block.attn.W_u.weight.device, dtype=torch.bfloat16
                 )
                 student_block.attn.W_r = nn.Linear(
-                    d_model, num_heads * rank, bias=False, device=W_k.device, dtype=torch.bfloat16
+                    d_model, num_heads * rank, bias=False, device=student_block.attn.W_r.weight.device, dtype=torch.bfloat16
                 )
 
-            student_block.attn.W_u.weight.copy_(svd_u_tiled)
-            student_block.attn.W_r.weight.copy_(svd_r_tiled)
+            student_block.attn.W_r.weight.copy_(svd_r_weights.to(student_block.attn.W_r.weight.device))
+            student_block.attn.W_u.weight.copy_(svd_u_weights.to(student_block.attn.W_u.weight.device))
 
             # 5. Initialize Decay and Beta Gates to Neutral Zero Baseline
             if hasattr(student_block.attn, "W_gate"):
@@ -303,6 +358,8 @@ def assemble_baretorch_directly_from_teacher(
     teacher_base = getattr(teacher_model, teacher_model.base_model_prefix, teacher_model)
     if hasattr(teacher_base, "norm"):
         norm_weight = teacher_base.norm.weight.data.clone()
+    elif hasattr(teacher_model, "norm"):
+        norm_weight = teacher_model.norm.weight.data.clone()
 
     teacher_rotary_emb = None
     if hasattr(teacher_base, "rotary_emb"):
@@ -325,20 +382,24 @@ def assemble_baretorch_directly_from_teacher(
         elif config.tie_word_embeddings:
             student_model.lm_head.weight = student_model.model.token_embedding.weight
 
-        if norm_weight is not None and hasattr(student_model.model, "final_layernorm"):
-            student_model.model.final_layernorm.weight.data.copy_(norm_weight.to(device))
+        # Transfer output RMSNorm weights
+        target_norm = getattr(student_model.model, "final_norm", None) or getattr(
+            student_model.model, "final_layernorm", None
+        )
+        if norm_weight is not None and target_norm is not None:
+            target_norm.weight.data.copy_(norm_weight.to(device))
+            if local_rank == 0:
+                logger.info("   ├─ Final RMSNorm inherited directly from teacher.")
 
     # Populate layers
     for l_idx in range(config.num_layers):
         if (l_idx + 1) % 4 == 0:
-            # 1:3 pattern: keep pristine native Teacher Transformer layer
             student_model.model.layers[l_idx] = teacher_base.layers[l_idx].to(device)
             if local_rank == 0:
                 logger.info(
                     f"   ├─ Layer {l_idx:02d}/{config.num_layers - 1:02d}: Native Teacher Transformer"
                 )
         else:
-            # Warm-start CS-LRAD layer
             warm_start_cslrad_layer(
                 teacher_layer=teacher_base.layers[l_idx],
                 student_block=student_model.model.layers[l_idx],
@@ -532,18 +593,6 @@ def get_two_phase_schedule(
     emb_lr_ratio: float = 0.02,
     min_lr_ratio: float = 0.0,
 ):
-    """
-    Two-Phase Learning Rate Schedule:
-      Group 0 & 1 (CS-LRAD Recurrent Layers):
-        - Phase 1 (0 to phase1_steps): Warmup -> Stable at base LR.
-        - Phase 2 (phase1_steps to total_steps): Cosine decay to min_lr_ratio.
-      Group 2 & 3 (Inherited MLPs & Attention):
-        - Phase 1: LR = 0.0 (Protected from distortion).
-        - Phase 2: Gentle warmup -> Cosine decay scaled by backbone_lr_ratio.
-      Group 4 (Embeddings & LM Head):
-        - Phase 1: LR = 0.0.
-        - Phase 2: Gentle warmup -> Cosine decay scaled by emb_lr_ratio.
-    """
     phase2_steps = max(1, total_steps - phase1_steps)
     phase2_warmup = max(1, int(phase2_steps * 0.05))
 
@@ -700,7 +749,6 @@ class TwoPhaseDistillTrainer(Trainer):
         except TypeError:
             loss = super().training_step(model, inputs)
 
-        # In Phase 1, purge non-CS-LRAD gradients after backward
         if self.state.global_step < self.phase1_steps:
             for p in self.non_cslrad_params:
                 p.grad = None
@@ -860,13 +908,13 @@ def main():
         "--backbone_lr_ratio",
         type=float,
         default=0.08,
-        help="Multiplier for MLPs and native Attention in Phase 2 (default: 0.08 => ~2e-5).",
+        help="Multiplier for MLPs and native Attention in Phase 2.",
     )
     parser.add_argument(
         "--emb_lr_ratio",
         type=float,
         default=0.02,
-        help="Multiplier for Embeddings and LM Head in Phase 2 (default: 0.02 => ~5e-6).",
+        help="Multiplier for Embeddings and LM Head in Phase 2.",
     )
     parser.add_argument("--warmup_steps", type=int, default=300)
     parser.add_argument("--weight_decay", type=float, default=0.01)
