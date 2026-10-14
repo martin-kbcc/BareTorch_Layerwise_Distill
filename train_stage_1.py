@@ -617,7 +617,7 @@ def get_two_phase_schedule(
             return 0.0
         p2_step = current_step - phase1_steps
         if p2_step < phase2_warmup:
-            mult = float(p2_step) / float(phase2_warmup)
+            return backbone_lr_ratio * (float(p2_step) / float(phase2_warmup))
         else:
             progress = float(p2_step - phase2_warmup) / float(max(1, phase2_steps - phase2_warmup))
             progress = min(1.0, max(0.0, progress))
@@ -629,7 +629,7 @@ def get_two_phase_schedule(
             return 0.0
         p2_step = current_step - phase1_steps
         if p2_step < phase2_warmup:
-            mult = float(p2_step) / float(phase2_warmup)
+            return emb_lr_ratio * (float(p2_step) / float(phase2_warmup))
         else:
             progress = float(p2_step - phase2_warmup) / float(max(1, phase2_steps - phase2_warmup))
             progress = min(1.0, max(0.0, progress))
@@ -649,7 +649,7 @@ def get_two_phase_schedule(
 
 
 # ==================================================================
-# 6. Two-Phase Distill Trainer (Renormalized Top-4 KL)
+# 6. Two-Phase Distill Trainer (Renormalized KL + Layerwise Cosine)
 # ==================================================================
 
 
@@ -657,8 +657,10 @@ class TwoPhaseDistillTrainer(Trainer):
     def __init__(
         self,
         *args,
-        alpha_ce=0.5,
-        alpha_kl=0.5,
+        online_teacher_model=None,
+        alpha_ce=0.35,
+        alpha_kl=0.35,
+        alpha_cos=0.30,
         temperature=1.0,
         phase1_steps=2000,
         backbone_lr_ratio=0.033,
@@ -666,13 +668,21 @@ class TwoPhaseDistillTrainer(Trainer):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.online_teacher_model = online_teacher_model
         self.alpha_ce = alpha_ce
         self.alpha_kl = alpha_kl
+        self.alpha_cos = alpha_cos
         self.temperature = temperature
         self.phase1_steps = phase1_steps
         self.backbone_lr_ratio = backbone_lr_ratio
         self.emb_lr_ratio = emb_lr_ratio
         self.non_cslrad_params = []
+
+        # Ensure online teacher is strictly evaluated and tracks no gradients
+        if self.online_teacher_model is not None:
+            self.online_teacher_model.eval()
+            for p in self.online_teacher_model.parameters():
+                p.requires_grad = False
 
     def create_optimizer(self):
         """Constructs 5 parameter groups with deduplication for tied embeddings."""
@@ -781,9 +791,57 @@ class TwoPhaseDistillTrainer(Trainer):
         if lm_head is None and hasattr(model, "module"):
             lm_head = getattr(model.module, "lm_head", None)
 
+        # ---------------------------------------------------------
+        # 1. Forward pass through Student
+        # ---------------------------------------------------------
         outputs = base_model(input_ids=input_ids, output_hidden_states=True)
-        last_hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+        # outputs.hidden_states is a tuple of L+1 tensors: (embedding, layer_1, ..., layer_L)
+        student_hiddens = (
+            outputs.hidden_states[1:]
+            if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None
+            else []
+        )
+        # Proper terminal activation passing through final RMSNorm
+        last_hidden = (
+            outputs.last_hidden_state
+            if hasattr(outputs, "last_hidden_state")
+            else outputs[0]
+        )
 
+        # ---------------------------------------------------------
+        # 2. Forward pass through Online Teacher (Layerwise Supervision)
+        # ---------------------------------------------------------
+        loss_cos = 0.0
+        if self.online_teacher_model is not None and self.alpha_cos > 0.0 and len(student_hiddens) > 0:
+            with torch.no_grad():
+                # Extract intermediate representations from Teacher
+                teacher_base = getattr(
+                    self.online_teacher_model,
+                    getattr(self.online_teacher_model, "base_model_prefix", "model"),
+                    self.online_teacher_model,
+                )
+                teacher_outputs = teacher_base(
+                    input_ids=input_ids, output_hidden_states=True, use_cache=False
+                )
+                teacher_hiddens = teacher_outputs.hidden_states[1:]
+
+            # Compute Mean Layerwise Cosine Distance
+            cos_losses = []
+            min_layers = min(len(student_hiddens), len(teacher_hiddens))
+            for i in range(min_layers):
+                h_s = student_hiddens[i]
+                h_t = teacher_hiddens[i]
+                # Cast to float32 for stable cosine calculation
+                sim = F.cosine_similarity(h_s.float(), h_t.float(), dim=-1)
+                # Cosine distance = 1 - sim
+                cos_losses.append(1.0 - sim.mean())
+
+            # Average distance across all layers
+            loss_cos = torch.stack(cos_losses).mean()
+
+        # ---------------------------------------------------------
+        # 3. Compute Logit Losses (CE + Renormalized KL)
+        # ---------------------------------------------------------
         shift_hidden = last_hidden[:, :-1, :]
         shift_labels = labels[:, 1:]
         shift_teacher_indices = teacher_indices[:, :-1, :]
@@ -810,12 +868,8 @@ class TwoPhaseDistillTrainer(Trainer):
                 reduction="sum",
             )
 
-            # Renormalized Top-4 Distillation:
-            # 1. Gather student raw logits for the top-4 teacher tokens
             st_top4_logits = torch.gather(c_log.float() / self.temperature, dim=-1, index=c_t_idx)
-            # 2. Renormalize strictly over the top-4 slice so mass sums to 1.0 (eliminates ~0.45 nat floor)
             lps_top4 = F.log_softmax(st_top4_logits, dim=-1)
-            # 3. Compute KL divergence
             kl = F.kl_div(lps_top4, c_t_p.float(), reduction="sum")
             return ce, kl
 
@@ -846,7 +900,17 @@ class TwoPhaseDistillTrainer(Trainer):
 
         loss_ce = total_loss_ce / num_tokens
         loss_kl = (total_loss_kl / num_tokens) * (self.temperature**2)
-        total_loss = (self.alpha_ce * loss_ce) + (self.alpha_kl * loss_kl)
+
+        # ---------------------------------------------------------
+        # 4. Composite Objective
+        # ---------------------------------------------------------
+        total_loss = (self.alpha_ce * loss_ce) + (self.alpha_kl * loss_kl) + (self.alpha_cos * loss_cos)
+
+        # Log standalone layerwise scalar purely for telemetry mapping
+        if isinstance(loss_cos, torch.Tensor) and self.state.global_step % self.args.logging_steps == 0:
+            if not hasattr(self, "_custom_metrics"):
+                self._custom_metrics = {}
+            self._custom_metrics["loss_layerwise_cos"] = loss_cos.item()
 
         return (total_loss, outputs) if return_outputs else total_loss
 
@@ -868,7 +932,7 @@ def main():
             )
 
     parser = argparse.ArgumentParser(
-        description="BareTorch End-to-End Distillation (2-Phase Differential LR)"
+        description="BareTorch End-to-End Distillation with Layerwise Online Teacher Supervision"
     )
 
     # Architecture
@@ -889,7 +953,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./checkpoints_e2e_distill",
+        default="./checkpoints_layerwise_distill",
     )
     parser.add_argument(
         "--tie_embeddings",
@@ -899,21 +963,22 @@ def main():
     )
 
     # Distillation Parameters
-    parser.add_argument("--alpha_ce", type=float, default=0.5)
-    parser.add_argument("--alpha_kl", type=float, default=0.5)
+    parser.add_argument("--alpha_ce", type=float, default=0.35)
+    parser.add_argument("--alpha_kl", type=float, default=0.35)
+    parser.add_argument("--alpha_cos", type=float, default=0.30, help="Weight for layerwise cosine distance loss")
     parser.add_argument("--temperature", type=float, default=1.0)
 
-    # Two-Phase Optimization
+    # Two-Phase Optimization (Tuned for a 10BT production alignment run)
     parser.add_argument(
         "--max_steps",
         type=int,
-        default=15258,
-        help="Total steps across both phases (~1B tokens @ EBS 32).",
+        default=12716,  # ~10BT at batch_size=12, accum=4, seq_len=2048, 8 GPUs
+        help="Total steps across both phases.",
     )
     parser.add_argument(
         "--phase1_steps",
         type=int,
-        default=2000,
+        default=6358,  # 50% of max_steps dedicated to strict Layerwise alignment
         help="Phase 1 steps: Only train CS-LRAD mixer layers (Backbone frozen).",
     )
     parser.add_argument(
@@ -934,23 +999,23 @@ def main():
         default=0.005,
         help="Multiplier for Embeddings and LM Head in Phase 2 (~1.5e-6).",
     )
-    parser.add_argument("--warmup_steps", type=int, default=300)
+    parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--grad_accum", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=12)
+    parser.add_argument("--grad_accum", type=int, default=4)
 
     # Dimensions
     parser.add_argument("--d_model", type=int, default=1024)
     parser.add_argument("--num_heads", type=int, default=16)
     parser.add_argument("--num_layers", type=int, default=24)
     parser.add_argument("--chunk_size", type=int, default=32)
-    parser.add_argument("--rank", type=int, default=8)
+    parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--seq_len", type=int, default=2048)
 
     # Performance & Sync
     parser.add_argument("--r2_sync", action="store_true", default=False)
     parser.add_argument("--r2_bucket", type=str, default="baretorch-data")
-    parser.add_argument("--r2_prefix", type=str, default="checkpoints_e2e")
+    parser.add_argument("--r2_prefix", type=str, default="checkpoints_layerwise")
     parser.add_argument("--compile", action="store_true", default=False)
     parser.add_argument("--grad_checkpointing", action="store_true", default=False)
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -994,7 +1059,24 @@ def main():
         rank=args.rank,
     )
 
-    # 2. Targeted torch.compile
+    # 2. Load Online Teacher Model for Layerwise Supervision
+    if local_rank == 0:
+        logger.info(f"📥 Loading online teacher '{args.teacher_model_name}' for layerwise supervision...")
+
+    online_teacher = AutoModelForCausalLM.from_pretrained(
+        args.teacher_model_name,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    ).to(device)
+    online_teacher.eval()
+    for param in online_teacher.parameters():
+        param.requires_grad = False
+
+    if local_rank == 0:
+        logger.info("✅ Online teacher loaded successfully on device.")
+
+    # 3. Targeted torch.compile
     if args.compile:
         compile_mode = "reduce-overhead" if args.grad_accum == 1 else "default"
         if local_rank == 0:
@@ -1014,17 +1096,15 @@ def main():
 
     if local_rank == 0:
         logger.info("=" * 70)
-        logger.info("🚀 BareTorch Direct End-to-End Distillation Initialized")
+        logger.info("🚀 BareTorch Layerwise Distillation Initialized")
         logger.info(f"   ├─ Total Parameters      : {total_params / 1e9:.3f} Billion ({total_params:,})")
         logger.info(f"   ├─ Embeddings Status     : {'TIED (lm_head == token_embedding)' if args.tie_embeddings else 'UNTIED'}")
         logger.info(f"   ├─ Phase 1 Steps (CS-LRAD): 0 to {args.phase1_steps:,} (Backbone Frozen)")
         logger.info(f"   ├─ Phase 2 Steps (Global) : {args.phase1_steps:,} to {args.max_steps:,} (Differential LR)")
-        logger.info(f"   ├─ Peak LR (CS-LRAD)      : {args.learning_rate:.2e}")
-        logger.info(f"   ├─ Peak LR (MLP Backbone) : {args.learning_rate * args.backbone_lr_ratio:.2e}")
-        logger.info(f"   ├─ Peak LR (Embeddings)   : {args.learning_rate * args.emb_lr_ratio:.2e}")
+        logger.info(f"   ├─ Loss Weights           : CE ({args.alpha_ce}), KL ({args.alpha_kl}), Cosine ({args.alpha_cos})")
         logger.info("=" * 70)
 
-    # 3. Datasets
+    # 4. Datasets
     train_dataset, val_dataset = build_disjoint_train_val_datasets(
         data_dir=args.data_cache_dir,
         seq_len=args.seq_len,
@@ -1033,7 +1113,7 @@ def main():
         eos_token_id=eos_token_id,
     )
 
-    # 4. Training Arguments
+    # 5. Training Arguments
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         max_steps=args.max_steps,
@@ -1057,7 +1137,7 @@ def main():
         remove_unused_columns=False,
     )
 
-    # 5. Cloudflare R2 Sync
+    # 6. Cloudflare R2 Sync
     enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in ("1", "true", "yes")
     r2_bucket = os.environ.get("R2_BUCKET", args.r2_bucket)
     r2_prefix = os.environ.get("R2_PREFIX", args.r2_prefix)
@@ -1070,22 +1150,24 @@ def main():
             )
         callbacks.append(R2CheckpointCallback(bucket_name=r2_bucket, prefix=r2_prefix))
 
-    # 6. Trainer
+    # 7. Trainer
     trainer = TwoPhaseDistillTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         callbacks=callbacks,
+        online_teacher_model=online_teacher,
         alpha_ce=args.alpha_ce,
         alpha_kl=args.alpha_kl,
+        alpha_cos=args.alpha_cos,
         temperature=args.temperature,
         phase1_steps=args.phase1_steps,
         backbone_lr_ratio=args.backbone_lr_ratio,
         emb_lr_ratio=args.emb_lr_ratio,
     )
 
-    # 7. Resumption
+    # 8. Resumption
     checkpoint_to_resume = None
     if os.path.exists(training_args.output_dir):
         existing_checkpoints = [
@@ -1100,12 +1182,12 @@ def main():
 
     trainer.train(resume_from_checkpoint=checkpoint_to_resume)
 
-    # 8. Save Final Model
+    # 9. Save Final Model
     if local_rank == 0:
         logger.info(f"💾 Saving final model & tokenizer to '{args.output_dir}'...")
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
-        logger.info("✅ End-to-End Distillation completed successfully!")
+        logger.info("✅ Layerwise Distillation completed successfully!")
 
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
