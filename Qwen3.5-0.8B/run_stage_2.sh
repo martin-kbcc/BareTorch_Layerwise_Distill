@@ -3,8 +3,8 @@
 # 🚀 BareTorch: Direct End-to-End Distillation Runner (20BT Production Run)
 # ==============================================================================
 # Description: Full-scale 20BT distillation runner across 8 H100 SXM5 GPUs.
-#              - Phase 1 (2.0BT / 3,815 steps): Recurrent routing adaptation (Backbone frozen)
-#              - Phase 2 (18.0BT / 34,332 steps): Global co-adaptation (Differential LRs)
+#              - Phase 1 (2.0BT / 2,543 steps): Recurrent routing adaptation (Backbone frozen)
+#              - Phase 2 (18.0BT / 22,888 steps): Global co-adaptation (Differential LRs)
 #              - Automated Cloudflare R2 checkpoint synchronization enabled
 # ==============================================================================
 
@@ -24,7 +24,7 @@ PYTHON_SCRIPT="${PROJECT_ROOT}/train_stage_1.py"
 
 # Path Directories
 DATA_CACHE_DIR="${PROJECT_ROOT}/data_20B/train"
-OUTPUT_DIR="${PROJECT_ROOT}/qwen3.5_0.8B_clm_checkpoints_20BT_lr1e-3"
+OUTPUT_DIR="${PROJECT_ROOT}/qwen3.5_0.8B_clm_checkpoints_20BT_lr3e-4"
 TEACHER_MODEL="Qwen/Qwen3.5-0.8B"
 LAYER_SEQUENCE="cs_lrad,cs_lrad,cs_lrad,transformer"
 
@@ -36,27 +36,27 @@ CHUNK_SIZE=32
 RANK=16
 SEQ_LEN=2048
 
-# Hardware Allocation (Effective Batch Size = 8 GPUs * 8 batch * 4 accum = 256 sequences)
-# Tokens per step = 256 * 2048 = 524,288 tokens/step
-BATCH_SIZE=8
+# Hardware Allocation (Effective Batch Size = 8 GPUs * 12 batch * 4 accum = 384 sequences)
+# Tokens per step = 384 * 2048 = 786,432 tokens/step
+BATCH_SIZE=12
 GRAD_ACCUM=4
 
-# Hyperparameters (20 Billion Tokens @ Effective Batch Size 256)
-# Total Steps for 20B Tokens = 20,000,000,000 / 524,288 ≈ 38,147 steps
-# Phase 1 Steps for 2B Tokens (10%) = 2,000,000,000 / 524,288 ≈ 3,815 steps
-# Phase 2 Steps for 18B Tokens (90%) = 38,147 - 3,815 = 34,332 steps
-MAX_STEPS=38147
-PHASE1_STEPS=3815
-WARMUP_STEPS=1000
+# Hyperparameters (20 Billion Tokens @ Effective Batch Size 384)
+# Total Steps for 20B Tokens = 20,000,000,000 / 786,432 ≈ 25,431 steps
+# Phase 1 Steps for 2B Tokens (10%) = 2,000,000,000 / 786,432 ≈ 2,543 steps
+# Phase 2 Steps for 18B Tokens (90%) = 25,431 - 2,543 = 22,888 steps
+MAX_STEPS=25431
+PHASE1_STEPS=2543
+WARMUP_STEPS=700
 WEIGHT_DECAY="0.01"
 
 # Differential Learning Rates
-LEARNING_RATE="1e-3"         # Base LR for CS-LRAD mixer layers
-BACKBONE_LR_RATIO="0.1"      # 0.1 * 1e-3 = 1e-4 for MLPs & Attention
-EMB_LR_RATIO="0.02"          # 0.02 * 1e-3 = 2e-5 for Embeddings & LM Head
+LEARNING_RATE="3e-4"         # Base LR for CS-LRAD mixer layers (strong plasticity)
+BACKBONE_LR_RATIO="0.033"    # 0.033 * 3e-4 = ~1e-5 for MLPs & native Attention (rigid anchor)
+EMB_LR_RATIO="0.005"         # 0.005 * 3e-4 = ~1.5e-6 for Embeddings & LM Head (semi-frozen)
 
 # Checkpoint & Eval Frequency
-LOGGING_STEPS=250
+LOGGING_STEPS=200
 SAVE_STEPS=1000
 EVAL_STEPS=1000
 
@@ -89,7 +89,7 @@ echo "CS-LRAD Configuration  : rank=${RANK}, chunk_size=${CHUNK_SIZE}, seq_len=$
 echo "Dataset Directory      : ${DATA_CACHE_DIR}"
 echo "Output Directory       : ${OUTPUT_DIR}"
 echo "Batch Configuration    : ${NUM_GPUS} GPUs x ${BATCH_SIZE} batch x ${GRAD_ACCUM} accum"
-echo "Tokens per Step        : ${TOKENS_PER_STEP} (524,288 tokens/step)"
+echo "Tokens per Step        : ${TOKENS_PER_STEP} (786,432 tokens/step)"
 echo "Total Training Steps   : ${MAX_STEPS} (~20 Billion Tokens)"
 echo "Phase 1 Steps (CS-LRAD): 0 to ${PHASE1_STEPS} (~2 Billion Tokens, Backbone Frozen)"
 echo "Phase 2 Steps (Global) : ${PHASE1_STEPS} to ${MAX_STEPS} (~18 Billion Tokens, Co-Adaptation)"
@@ -145,6 +145,7 @@ torchrun --nproc_per_node="${NUM_GPUS}" "${PYTHON_SCRIPT}" \
     --r2_bucket "${R2_BUCKET}" \
     --r2_prefix "${R2_PREFIX}" \
     --compile \
+    --tie_embeddings \
     ${R2_FLAG}
 
 echo "=================================================================="

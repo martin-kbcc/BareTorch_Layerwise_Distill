@@ -190,7 +190,7 @@ def safe_copy_linear(target_module, target_attr, source_linear):
 def warm_start_cslrad_layer(teacher_layer, student_block: LRADDecoderBlock, rank=8):
     """
     Transfers matching projections from teacher layer to LRADDecoderBlock.
-    Applies per-head SVD projection factoring W_q^T * W_k and handles GQA head expansion.
+    Applies per-head SVD projection factoring W_q^T * W_k and enforces recency decay bias.
     """
     with torch.no_grad():
         # 1. Copy RMSNorms
@@ -295,11 +295,12 @@ def warm_start_cslrad_layer(teacher_layer, student_block: LRADDecoderBlock, rank
             student_block.attn.W_r.weight.copy_(svd_r_weights.to(student_block.attn.W_r.weight.device))
             student_block.attn.W_u.weight.copy_(svd_u_weights.to(student_block.attn.W_u.weight.device))
 
-            # 5. Initialize Decay and Beta Gates to Neutral Zero Baseline
+            # 5. Initialize Decay and Beta Gates (Enforce Recency Bias)
             if hasattr(student_block.attn, "W_gate"):
                 torch.nn.init.zeros_(student_block.attn.W_gate.weight)
                 if student_block.attn.W_gate.bias is not None:
-                    torch.nn.init.zeros_(student_block.attn.W_gate.bias)
+                    # Enforce recency bias (sigmoid(-1.5) ~ 0.18) so memory clears stale history from step 0
+                    torch.nn.init.constant_(student_block.attn.W_gate.bias, -1.5)
 
             if hasattr(student_block.attn, "W_beta_gate"):
                 torch.nn.init.zeros_(student_block.attn.W_beta_gate.weight)
@@ -313,7 +314,7 @@ def assemble_baretorch_directly_from_teacher(
     device: torch.device,
     rank: int = 8,
 ) -> BareTorchForCausalLM:
-    """Directly synthesizes BareTorch model from Teacher weights with zero Stage 1 file reliance."""
+    """Directly synthesizes BareTorch model from Teacher weights with tied/untied embedding support."""
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     proc_rank = int(os.environ.get("RANK", 0))
 
@@ -377,10 +378,15 @@ def assemble_baretorch_directly_from_teacher(
     with torch.no_grad():
         student_model.model.token_embedding.weight.data.copy_(teacher_emb.to(device))
 
-        if lm_head_weight is not None and hasattr(student_model, "lm_head"):
-            student_model.lm_head.weight.data.copy_(lm_head_weight.to(device))
-        elif config.tie_word_embeddings:
+        # Respect tie_word_embeddings configuration explicitly
+        if config.tie_word_embeddings:
             student_model.lm_head.weight = student_model.model.token_embedding.weight
+            if local_rank == 0:
+                logger.info("   ├─ 🔗 Word Embeddings TIED: lm_head.weight bound directly to token_embedding.weight.")
+        elif lm_head_weight is not None and hasattr(student_model, "lm_head"):
+            student_model.lm_head.weight.data.copy_(lm_head_weight.to(device))
+            if local_rank == 0:
+                logger.info("   ├─ Word Embeddings UNTIED: lm_head.weight initialized independently.")
 
         # Transfer output RMSNorm weights
         target_norm = getattr(student_model.model, "final_norm", None) or getattr(
@@ -589,8 +595,8 @@ def get_two_phase_schedule(
     num_warmup_steps: int,
     phase1_steps: int,
     total_steps: int,
-    backbone_lr_ratio: float = 0.08,
-    emb_lr_ratio: float = 0.02,
+    backbone_lr_ratio: float = 0.033,
+    emb_lr_ratio: float = 0.005,
     min_lr_ratio: float = 0.0,
 ):
     phase2_steps = max(1, total_steps - phase1_steps)
@@ -643,7 +649,7 @@ def get_two_phase_schedule(
 
 
 # ==================================================================
-# 6. Two-Phase Distill Trainer (50% CE + 50% Top-4 KL)
+# 6. Two-Phase Distill Trainer (Renormalized Top-4 KL)
 # ==================================================================
 
 
@@ -655,8 +661,8 @@ class TwoPhaseDistillTrainer(Trainer):
         alpha_kl=0.5,
         temperature=1.0,
         phase1_steps=2000,
-        backbone_lr_ratio=0.08,
-        emb_lr_ratio=0.02,
+        backbone_lr_ratio=0.033,
+        emb_lr_ratio=0.005,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -669,7 +675,7 @@ class TwoPhaseDistillTrainer(Trainer):
         self.non_cslrad_params = []
 
     def create_optimizer(self):
-        """Constructs 5 distinct parameter groups for differential optimization."""
+        """Constructs 5 parameter groups with deduplication for tied embeddings."""
         if self.optimizer is None:
             decay_parameters = self.get_decay_parameter_names(self.model)
 
@@ -678,10 +684,14 @@ class TwoPhaseDistillTrainer(Trainer):
             backbone_decay = []
             backbone_no_decay = []
             emb_head = []
+            seen_param_ids = set()
 
             for n, p in self.model.named_parameters():
                 if not p.requires_grad:
                     continue
+                if id(p) in seen_param_ids:
+                    continue
+                seen_param_ids.add(id(p))
 
                 if any(k in n for k in ["token_embedding", "lm_head"]):
                     emb_head.append(p)
@@ -799,9 +809,14 @@ class TwoPhaseDistillTrainer(Trainer):
                 ignore_index=-100,
                 reduction="sum",
             )
-            lps = F.log_softmax(c_log.float() / self.temperature, dim=-1)
-            st_top4 = torch.gather(lps, dim=-1, index=c_t_idx)
-            kl = F.kl_div(st_top4, c_t_p.float(), reduction="sum")
+
+            # Renormalized Top-4 Distillation:
+            # 1. Gather student raw logits for the top-4 teacher tokens
+            st_top4_logits = torch.gather(c_log.float() / self.temperature, dim=-1, index=c_t_idx)
+            # 2. Renormalize strictly over the top-4 slice so mass sums to 1.0 (eliminates ~0.45 nat floor)
+            lps_top4 = F.log_softmax(st_top4_logits, dim=-1)
+            # 3. Compute KL divergence
+            kl = F.kl_div(lps_top4, c_t_p.float(), reduction="sum")
             return ce, kl
 
         for c_start in range(0, L_shift, chunk_size):
@@ -877,7 +892,10 @@ def main():
         default="./checkpoints_e2e_distill",
     )
     parser.add_argument(
-        "--tie_embeddings", action="store_true", default=False
+        "--tie_embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Tie token embeddings and lm_head weights (default: True).",
     )
 
     # Distillation Parameters
@@ -901,20 +919,20 @@ def main():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=2.5e-4,
+        default=3e-4,
         help="Base peak learning rate for CS-LRAD recurrent layers.",
     )
     parser.add_argument(
         "--backbone_lr_ratio",
         type=float,
-        default=0.08,
-        help="Multiplier for MLPs and native Attention in Phase 2.",
+        default=0.033,
+        help="Multiplier for MLPs and native Attention in Phase 2 (~1e-5).",
     )
     parser.add_argument(
         "--emb_lr_ratio",
         type=float,
-        default=0.02,
-        help="Multiplier for Embeddings and LM Head in Phase 2.",
+        default=0.005,
+        help="Multiplier for Embeddings and LM Head in Phase 2 (~1.5e-6).",
     )
     parser.add_argument("--warmup_steps", type=int, default=300)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -998,6 +1016,7 @@ def main():
         logger.info("=" * 70)
         logger.info("🚀 BareTorch Direct End-to-End Distillation Initialized")
         logger.info(f"   ├─ Total Parameters      : {total_params / 1e9:.3f} Billion ({total_params:,})")
+        logger.info(f"   ├─ Embeddings Status     : {'TIED (lm_head == token_embedding)' if args.tie_embeddings else 'UNTIED'}")
         logger.info(f"   ├─ Phase 1 Steps (CS-LRAD): 0 to {args.phase1_steps:,} (Backbone Frozen)")
         logger.info(f"   ├─ Phase 2 Steps (Global) : {args.phase1_steps:,} to {args.max_steps:,} (Differential LR)")
         logger.info(f"   ├─ Peak LR (CS-LRAD)      : {args.learning_rate:.2e}")
