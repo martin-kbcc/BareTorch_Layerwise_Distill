@@ -427,11 +427,12 @@ def assemble_baretorch_directly_from_teacher(
 
 
 # ==================================================================
-# 4. Teacher Predictions Triplet Memory-Mapped Dataset
+# 4. Datasets (Distill for Training, Eval for Pure Cross-Entropy)
 # ==================================================================
 
 
 class DistillMemmapDataset(Dataset):
+    """Full dataset loading raw tokens, teacher indices, and teacher logit values for training."""
     def __init__(
         self,
         data_dir: str,
@@ -497,6 +498,64 @@ class DistillMemmapDataset(Dataset):
             "labels": tokens.clone(),
             "teacher_indices": teacher_indices,
             "teacher_values": teacher_values,
+        }
+
+
+class EvalMemmapDataset(Dataset):
+    """Lightweight dataset loading ONLY raw tokens for pure Cross-Entropy evaluation."""
+    def __init__(
+        self,
+        data_dir: str,
+        seq_len: int = 2048,
+        samples: list = None,
+        vocab_size: int = 248320,
+        eos_token_id: int = 248044,
+    ):
+        self.data_dir = data_dir
+        self.seq_len = seq_len
+        self.vocab_size = vocab_size
+        self.eos_token_id = eos_token_id
+        self.samples = samples if samples is not None else []
+
+    def _get_worker_mmap(self, path, dtype, shape):
+        current_pid = os.getpid()
+        if (
+            not hasattr(self, "_worker_mmap_cache")
+            or getattr(self, "_worker_pid", None) != current_pid
+        ):
+            self._worker_mmap_cache = {}
+            self._worker_pid = current_pid
+
+        if path not in self._worker_mmap_cache:
+            m = np.memmap(path, dtype=dtype, mode="r")
+            m.flags.writeable = False
+            self._worker_mmap_cache[path] = m.reshape(shape)
+
+        return self._worker_mmap_cache[path]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        if len(self.samples) == 0:
+            raise RuntimeError(f"Dataset in directory '{self.data_dir}' is empty.")
+
+        s_idx = idx % len(self.samples)
+        # We only need the token path (t_path)
+        t_path, _, _, s_i = self.samples[s_idx]
+
+        tok_mmap = self._get_worker_mmap(t_path, np.uint32, (-1, self.seq_len))
+        raw_tokens = tok_mmap[s_i].astype(np.int64)
+
+        oov_tok_mask = (raw_tokens < 0) | (raw_tokens >= self.vocab_size)
+        if oov_tok_mask.any():
+            raw_tokens[oov_tok_mask] = self.eos_token_id
+
+        tokens = torch.from_numpy(raw_tokens)
+
+        return {
+            "input_ids": tokens,
+            "labels": tokens.clone(),
         }
 
 
@@ -567,7 +626,8 @@ def build_disjoint_train_val_datasets(
         vocab_size=vocab_size,
         eos_token_id=eos_token_id,
     )
-    val_ds = DistillMemmapDataset(
+    # Validation strictly uses the EvalMemmapDataset for pure CE computation
+    val_ds = EvalMemmapDataset(
         data_dir,
         seq_len=seq_len,
         samples=val_samples,
@@ -579,7 +639,7 @@ def build_disjoint_train_val_datasets(
     if local_rank == 0:
         logger.info(
             f"Loaded dataset pool: {len(train_ds):,} train sequences (~{(len(train_ds)*seq_len)/1e6:.1f}M tokens) | "
-            f"{len(val_ds):,} val sequences (~{(len(val_ds)*seq_len)/1e6:.1f}M tokens)"
+            f"{len(val_ds):,} val sequences (~{(len(val_ds)*seq_len)/1e6:.1f}M tokens pure CE)"
         )
 
     return train_ds, val_ds
@@ -595,8 +655,8 @@ def get_two_phase_schedule(
     num_warmup_steps: int,
     phase1_steps: int,
     total_steps: int,
-    backbone_lr_ratio: float = 0.033,
-    emb_lr_ratio: float = 0.005,
+    backbone_lr_ratio: float = 0.10,
+    emb_lr_ratio: float = 0.01,
     min_lr_ratio: float = 0.0,
 ):
     phase2_steps = max(1, total_steps - phase1_steps)
@@ -661,17 +721,28 @@ class TwoPhaseDistillTrainer(Trainer):
         alpha_ce=0.35,
         alpha_kl=0.35,
         alpha_cos=0.30,
+        phase2_alpha_ce=0.45,
+        phase2_alpha_kl=0.45,
+        phase2_alpha_cos=0.10,
         temperature=1.0,
-        phase1_steps=2000,
-        backbone_lr_ratio=0.033,
-        emb_lr_ratio=0.005,
+        phase1_steps=6358,
+        backbone_lr_ratio=0.10,
+        emb_lr_ratio=0.01,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.online_teacher_model = online_teacher_model
+        
+        # Phase 1 Weights
         self.alpha_ce = alpha_ce
         self.alpha_kl = alpha_kl
         self.alpha_cos = alpha_cos
+        
+        # Phase 2 Weights
+        self.phase2_alpha_ce = phase2_alpha_ce
+        self.phase2_alpha_kl = phase2_alpha_kl
+        self.phase2_alpha_cos = phase2_alpha_cos
+        
         self.temperature = temperature
         self.phase1_steps = phase1_steps
         self.backbone_lr_ratio = backbone_lr_ratio
@@ -780,8 +851,6 @@ class TwoPhaseDistillTrainer(Trainer):
 
         input_ids = inputs["input_ids"]
         labels = inputs["labels"]
-        teacher_indices = inputs["teacher_indices"]
-        teacher_values = inputs["teacher_values"]
 
         base_model = getattr(model, "model", model)
         if hasattr(model, "module"):
@@ -792,29 +861,48 @@ class TwoPhaseDistillTrainer(Trainer):
             lm_head = getattr(model.module, "lm_head", None)
 
         # ---------------------------------------------------------
-        # 1. Forward pass through Student
+        # FAST PATH: Pure Cross-Entropy Evaluation (No Teacher Data)
         # ---------------------------------------------------------
+        if "teacher_indices" not in inputs:
+            outputs = base_model(input_ids=input_ids, output_hidden_states=False)
+            last_hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+
+            shift_hidden = last_hidden[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            target_dtype = lm_head.weight.dtype if hasattr(lm_head, "weight") else torch.bfloat16
+            shift_hidden = shift_hidden.to(target_dtype)
+
+            logits = lm_head(shift_hidden)
+            loss_ce = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+            return (loss_ce, outputs) if return_outputs else loss_ce
+
+        # ---------------------------------------------------------
+        # TRAINING PATH: Distillation Computation
+        # ---------------------------------------------------------
+        teacher_indices = inputs["teacher_indices"]
+        teacher_values = inputs["teacher_values"]
+
         outputs = base_model(input_ids=input_ids, output_hidden_states=True)
-        # outputs.hidden_states is a tuple of L+1 tensors: (embedding, layer_1, ..., layer_L)
         student_hiddens = (
             outputs.hidden_states[1:]
             if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None
             else []
         )
-        # Proper terminal activation passing through final RMSNorm
         last_hidden = (
             outputs.last_hidden_state
             if hasattr(outputs, "last_hidden_state")
             else outputs[0]
         )
 
-        # ---------------------------------------------------------
-        # 2. Forward pass through Online Teacher (Layerwise Supervision)
-        # ---------------------------------------------------------
+        # Layerwise Cosine Distance
         loss_cos = 0.0
-        if self.online_teacher_model is not None and self.alpha_cos > 0.0 and len(student_hiddens) > 0:
+        if self.online_teacher_model is not None and len(student_hiddens) > 0:
             with torch.no_grad():
-                # Extract intermediate representations from Teacher
                 teacher_base = getattr(
                     self.online_teacher_model,
                     getattr(self.online_teacher_model, "base_model_prefix", "model"),
@@ -825,23 +913,17 @@ class TwoPhaseDistillTrainer(Trainer):
                 )
                 teacher_hiddens = teacher_outputs.hidden_states[1:]
 
-            # Compute Mean Layerwise Cosine Distance
             cos_losses = []
             min_layers = min(len(student_hiddens), len(teacher_hiddens))
             for i in range(min_layers):
                 h_s = student_hiddens[i]
                 h_t = teacher_hiddens[i]
-                # Cast to float32 for stable cosine calculation
                 sim = F.cosine_similarity(h_s.float(), h_t.float(), dim=-1)
-                # Cosine distance = 1 - sim
                 cos_losses.append(1.0 - sim.mean())
 
-            # Average distance across all layers
             loss_cos = torch.stack(cos_losses).mean()
 
-        # ---------------------------------------------------------
-        # 3. Compute Logit Losses (CE + Renormalized KL)
-        # ---------------------------------------------------------
+        # Compute Logit Losses (CE + Renormalized KL)
         shift_hidden = last_hidden[:, :-1, :]
         shift_labels = labels[:, 1:]
         shift_teacher_indices = teacher_indices[:, :-1, :]
@@ -902,15 +984,26 @@ class TwoPhaseDistillTrainer(Trainer):
         loss_kl = (total_loss_kl / num_tokens) * (self.temperature**2)
 
         # ---------------------------------------------------------
-        # 4. Composite Objective
+        # 4. Dynamic Composite Objective (Phase 1 vs Phase 2)
         # ---------------------------------------------------------
-        total_loss = (self.alpha_ce * loss_ce) + (self.alpha_kl * loss_kl) + (self.alpha_cos * loss_cos)
+        if self.state.global_step < self.phase1_steps:
+            cur_alpha_ce = self.alpha_ce
+            cur_alpha_kl = self.alpha_kl
+            cur_alpha_cos = self.alpha_cos
+        else:
+            cur_alpha_ce = self.phase2_alpha_ce
+            cur_alpha_kl = self.phase2_alpha_kl
+            cur_alpha_cos = self.phase2_alpha_cos
 
-        # Log standalone layerwise scalar purely for telemetry mapping
-        if isinstance(loss_cos, torch.Tensor) and self.state.global_step % self.args.logging_steps == 0:
+        total_loss = (cur_alpha_ce * loss_ce) + (cur_alpha_kl * loss_kl) + (cur_alpha_cos * loss_cos)
+
+        # Log standalone scalars for telemetry mapping
+        if self.state.global_step % self.args.logging_steps == 0:
             if not hasattr(self, "_custom_metrics"):
                 self._custom_metrics = {}
-            self._custom_metrics["loss_layerwise_cos"] = loss_cos.item()
+            if isinstance(loss_cos, torch.Tensor):
+                self._custom_metrics["loss_layerwise_cos"] = loss_cos.item()
+            self._custom_metrics["active_alpha_cos"] = cur_alpha_cos
 
         return (total_loss, outputs) if return_outputs else total_loss
 
@@ -962,42 +1055,48 @@ def main():
         help="Tie token embeddings and lm_head weights (default: True).",
     )
 
-    # Distillation Parameters
+    # Phase 1 Distillation Parameters
     parser.add_argument("--alpha_ce", type=float, default=0.35)
     parser.add_argument("--alpha_kl", type=float, default=0.35)
-    parser.add_argument("--alpha_cos", type=float, default=0.30, help="Weight for layerwise cosine distance loss")
+    parser.add_argument("--alpha_cos", type=float, default=0.30, help="Weight for layerwise cosine distance loss (Phase 1)")
+    
+    # Phase 2 Distillation Parameters
+    parser.add_argument("--phase2_alpha_ce", type=float, default=0.45)
+    parser.add_argument("--phase2_alpha_kl", type=float, default=0.45)
+    parser.add_argument("--phase2_alpha_cos", type=float, default=0.10, help="Weight for layerwise cosine distance loss (Phase 2)")
+    
     parser.add_argument("--temperature", type=float, default=1.0)
 
-    # Two-Phase Optimization (Tuned for a 10BT production alignment run)
+    # Two-Phase Optimization (Tuned for 40BT Production Run)
     parser.add_argument(
         "--max_steps",
         type=int,
-        default=12716,  # ~10BT at batch_size=12, accum=4, seq_len=2048, 8 GPUs
+        default=50862,  # ~40BT at batch_size=12, accum=4, seq_len=2048, 8 GPUs
         help="Total steps across both phases.",
     )
     parser.add_argument(
         "--phase1_steps",
         type=int,
-        default=6358,  # 50% of max_steps dedicated to strict Layerwise alignment
+        default=6358,  # ~5BT dedicated to Phase 1 strict alignment
         help="Phase 1 steps: Only train CS-LRAD mixer layers (Backbone frozen).",
     )
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=3e-4,
+        default=5e-4,  # Increased LR for CS-LRAD
         help="Base peak learning rate for CS-LRAD recurrent layers.",
     )
     parser.add_argument(
         "--backbone_lr_ratio",
         type=float,
-        default=0.033,
-        help="Multiplier for MLPs and native Attention in Phase 2 (~1e-5).",
+        default=0.10,  # 0.1 * 5e-4 = ~5e-5
+        help="Multiplier for MLPs and native Attention in Phase 2.",
     )
     parser.add_argument(
         "--emb_lr_ratio",
         type=float,
-        default=0.005,
-        help="Multiplier for Embeddings and LM Head in Phase 2 (~1.5e-6).",
+        default=0.01,  # 0.01 * 5e-4 = ~5e-6
+        help="Multiplier for Embeddings and LM Head in Phase 2.",
     )
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -1101,7 +1200,8 @@ def main():
         logger.info(f"   ├─ Embeddings Status     : {'TIED (lm_head == token_embedding)' if args.tie_embeddings else 'UNTIED'}")
         logger.info(f"   ├─ Phase 1 Steps (CS-LRAD): 0 to {args.phase1_steps:,} (Backbone Frozen)")
         logger.info(f"   ├─ Phase 2 Steps (Global) : {args.phase1_steps:,} to {args.max_steps:,} (Differential LR)")
-        logger.info(f"   ├─ Loss Weights           : CE ({args.alpha_ce}), KL ({args.alpha_kl}), Cosine ({args.alpha_cos})")
+        logger.info(f"   ├─ Phase 1 Loss Weights   : CE ({args.alpha_ce}), KL ({args.alpha_kl}), Cosine ({args.alpha_cos})")
+        logger.info(f"   ├─ Phase 2 Loss Weights   : CE ({args.phase2_alpha_ce}), KL ({args.phase2_alpha_kl}), Cosine ({args.phase2_alpha_cos})")
         logger.info("=" * 70)
 
     # 4. Datasets
@@ -1161,6 +1261,9 @@ def main():
         alpha_ce=args.alpha_ce,
         alpha_kl=args.alpha_kl,
         alpha_cos=args.alpha_cos,
+        phase2_alpha_ce=args.phase2_alpha_ce,
+        phase2_alpha_kl=args.phase2_alpha_kl,
+        phase2_alpha_cos=args.phase2_alpha_cos,
         temperature=args.temperature,
         phase1_steps=args.phase1_steps,
         backbone_lr_ratio=args.backbone_lr_ratio,

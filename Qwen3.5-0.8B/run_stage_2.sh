@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🚀 BareTorch: Layerwise Tripartite Distillation Runner (10BT Production Run)
+# 🚀 BareTorch: Layerwise Distillation Test Runner (1BT Pilot Run)
 # ==============================================================================
-# Description: 10BT Layerwise supervision runner across 8 H100 SXM5 GPUs.
-#              - Phase 1 (5.0BT / 6,358 steps): Layerwise cosine alignment (Backbone frozen)
-#              - Phase 2 (5.0BT / 6,358 steps): Global co-adaptation (Differential LRs)
-#              - Loss: 0.35 CE + 0.35 Top-4 KL + 0.30 Layerwise Cosine Distance
-#              - Automated Cloudflare R2 checkpoint synchronization enabled
+# Description: 1BT validation and sanity-check runner across 8 H100 SXM5 GPUs.
+#              - Total Tokens: ~1.0 Billion (1,272 steps @ 786,432 tokens/step)
+#              - Phase 1 (500M tokens / 636 steps): CS-LRAD alignment (Backbone frozen)
+#                Loss: 0.35 CE + 0.35 Top-4 KL + 0.30 Layerwise Cosine
+#              - Phase 2 (500M tokens / 636 steps): Global co-adaptation
+#                Loss: 0.45 CE + 0.45 Top-4 KL + 0.10 Layerwise Cosine
+#              - Validation: Pure Cross-Entropy on raw tokenized sequences
+#              - Differential LR: CS-LRAD (5e-4), Backbone (5e-5), Embeddings (5e-6)
 # ==============================================================================
 
 set -euo pipefail
@@ -23,9 +26,9 @@ ulimit -n 65536
 NUM_GPUS=8
 PYTHON_SCRIPT="${PROJECT_ROOT}/train_stage_1.py"
 
-# Path Directories (Updated for Layerwise Run)
+# Path Directories
 DATA_CACHE_DIR="${PROJECT_ROOT}/data_20B/train"
-OUTPUT_DIR="${PROJECT_ROOT}/qwen3.5_0.8B_clm_layerwise_10BT_lr3e-4"
+OUTPUT_DIR="${PROJECT_ROOT}/qwen3.5_0.8B_clm_layerwise_1BT_test_lr5e-4"
 TEACHER_MODEL="Qwen/Qwen3.5-0.8B"
 LAYER_SEQUENCE="cs_lrad,cs_lrad,cs_lrad,transformer"
 
@@ -42,34 +45,39 @@ SEQ_LEN=2048
 BATCH_SIZE=12
 GRAD_ACCUM=4
 
-# Hyperparameters (10 Billion Tokens @ Effective Batch Size 384)
-# Total Steps for 10B Tokens = 10,000,000,000 / 786,432 ≈ 12,716 steps
-# Phase 1 Steps for 5B Tokens (50%) = 5,000,000,000 / 786,432 ≈ 6,358 steps
-# Phase 2 Steps for 5B Tokens (50%) = 12,716 - 6,358 = 6,358 steps
-MAX_STEPS=12716
-PHASE1_STEPS=6358
-WARMUP_STEPS=500
+# Hyperparameters (1 Billion Tokens @ Effective Batch Size 384)
+# Total Steps for 1B Tokens    = 1,000,000,000 / 786,432 ≈ 1,272 steps
+# Phase 1 Steps for 500M Tokens = 500,000,000 / 786,432 ≈ 636 steps
+# Phase 2 Steps for 500M Tokens = 1,272 - 636 = 636 steps
+MAX_STEPS=1272
+PHASE1_STEPS=636
+WARMUP_STEPS=100
 WEIGHT_DECAY="0.01"
 
-# Tripartite Loss Weights
+# Phase 1 Loss Weights (Scaffolding Alignment)
 ALPHA_CE="0.35"
 ALPHA_KL="0.35"
 ALPHA_COS="0.30"
 
-# Differential Learning Rates
-LEARNING_RATE="3e-4"         # Base LR for CS-LRAD mixer layers (strong plasticity)
-BACKBONE_LR_RATIO="0.033"    # 0.033 * 3e-4 = ~1e-5 for MLPs & native Attention (rigid anchor)
-EMB_LR_RATIO="0.005"         # 0.005 * 3e-4 = ~1.5e-6 for Embeddings & LM Head (semi-frozen)
+# Phase 2 Loss Weights (Rebalanced Co-adaptation)
+PHASE2_ALPHA_CE="0.45"
+PHASE2_ALPHA_KL="0.45"
+PHASE2_ALPHA_COS="0.10"
 
-# Checkpoint & Eval Frequency
-LOGGING_STEPS=200
-SAVE_STEPS=1000
-EVAL_STEPS=1000
+# Differential Learning Rates
+LEARNING_RATE="5e-4"         # Base LR for CS-LRAD mixer layers (strong plasticity)
+BACKBONE_LR_RATIO="0.10"     # 0.10 * 5e-4 = 5e-5 for MLPs & native Attention
+EMB_LR_RATIO="0.01"          # 0.01 * 5e-4 = 5e-6 for Embeddings & LM Head
+
+# Checkpoint & Eval Frequency (Tuned for 1,272 Steps)
+LOGGING_STEPS=20
+SAVE_STEPS=300
+EVAL_STEPS=100
 
 # Cloudflare R2 Sync Settings
 ENABLE_R2_SYNC=true
 R2_BUCKET="baretorch-data"
-R2_PREFIX="qwen3.5_0.8B_clm_layerwise_10BT"
+R2_PREFIX="qwen3.5_0.8B_clm_layerwise_1BT_test"
 
 # ------------------------------------------------------------------------------
 # 2. Environment Variables & Hardware Optimizations
@@ -85,7 +93,7 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 TOKENS_PER_STEP=$(( BATCH_SIZE * GRAD_ACCUM * NUM_GPUS * SEQ_LEN ))
 
 echo "=================================================================="
-echo "🚀 Initializing BareTorch Layerwise Distillation (8x H100)"
+echo "🚀 Initializing BareTorch Layerwise Distillation (1BT Pilot Run)"
 echo "=================================================================="
 echo "Target Script          : ${PYTHON_SCRIPT}"
 echo "Number of GPUs         : ${NUM_GPUS}x H100 SXM5"
@@ -96,13 +104,15 @@ echo "Dataset Directory      : ${DATA_CACHE_DIR}"
 echo "Output Directory       : ${OUTPUT_DIR}"
 echo "Batch Configuration    : ${NUM_GPUS} GPUs x ${BATCH_SIZE} batch x ${GRAD_ACCUM} accum"
 echo "Tokens per Step        : ${TOKENS_PER_STEP} (786,432 tokens/step)"
-echo "Total Training Steps   : ${MAX_STEPS} (~10 Billion Tokens)"
-echo "Phase 1 Steps (CS-LRAD): 0 to ${PHASE1_STEPS} (~5 Billion Tokens, Backbone Frozen)"
-echo "Phase 2 Steps (Global) : ${PHASE1_STEPS} to ${MAX_STEPS} (~5 Billion Tokens, Co-Adaptation)"
-echo "Loss Weights           : CE=${ALPHA_CE}, KL=${ALPHA_KL}, Layerwise-Cos=${ALPHA_COS}"
+echo "Total Training Steps   : ${MAX_STEPS} (~1.0 Billion Tokens, ~56 min wall-clock)"
+echo "Phase 1 Steps (CS-LRAD): 0 to ${PHASE1_STEPS} (500M Tokens, Backbone Frozen)"
+echo "Phase 2 Steps (Global) : ${PHASE1_STEPS} to ${MAX_STEPS} (500M Tokens, Differential LR)"
+echo "Phase 1 Loss Weights   : CE=${ALPHA_CE}, KL=${ALPHA_KL}, Cosine=${ALPHA_COS}"
+echo "Phase 2 Loss Weights   : CE=${PHASE2_ALPHA_CE}, KL=${PHASE2_ALPHA_KL}, Cosine=${PHASE2_ALPHA_COS}"
 echo "Base LR (CS-LRAD)      : ${LEARNING_RATE}"
 echo "Backbone Peak LR       : $(python3 -c "print(${LEARNING_RATE} * ${BACKBONE_LR_RATIO})") (Ratio: ${BACKBONE_LR_RATIO})"
 echo "Embeddings Peak LR     : $(python3 -c "print(${LEARNING_RATE} * ${EMB_LR_RATIO})") (Ratio: ${EMB_LR_RATIO})"
+echo "Validation Mode        : Pure Cross-Entropy (Raw Tokens)"
 echo "Cloudflare R2 Sync     : ${ENABLE_R2_SYNC} (Target: r2://${R2_BUCKET}/${R2_PREFIX})"
 echo "=================================================================="
 
@@ -154,11 +164,14 @@ torchrun --nproc_per_node="${NUM_GPUS}" "${PYTHON_SCRIPT}" \
     --alpha_ce "${ALPHA_CE}" \
     --alpha_kl "${ALPHA_KL}" \
     --alpha_cos "${ALPHA_COS}" \
+    --phase2_alpha_ce "${PHASE2_ALPHA_CE}" \
+    --phase2_alpha_kl "${PHASE2_ALPHA_KL}" \
+    --phase2_alpha_cos "${PHASE2_ALPHA_COS}" \
     --compile \
     --tie_embeddings \
     ${R2_FLAG}
 
 echo "=================================================================="
-echo "🎉 10BT LAYERWISE DISTILLATION RUN COMPLETE!"
-echo "   Consolidated model weights and tokenizer saved to '${OUTPUT_DIR}'"
+echo "🎉 1BT PILOT DISTILLATION RUN COMPLETE!"
+echo "   Model checkpoints and tokenizer saved to '${OUTPUT_DIR}'"
 echo "=================================================================="
