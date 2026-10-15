@@ -433,6 +433,7 @@ def assemble_baretorch_directly_from_teacher(
 
 class DistillMemmapDataset(Dataset):
     """Full dataset loading raw tokens, teacher indices, and teacher logit values for training."""
+
     def __init__(
         self,
         data_dir: str,
@@ -503,6 +504,7 @@ class DistillMemmapDataset(Dataset):
 
 class EvalMemmapDataset(Dataset):
     """Lightweight dataset loading ONLY raw tokens for pure Cross-Entropy evaluation."""
+
     def __init__(
         self,
         data_dir: str,
@@ -541,7 +543,6 @@ class EvalMemmapDataset(Dataset):
             raise RuntimeError(f"Dataset in directory '{self.data_dir}' is empty.")
 
         s_idx = idx % len(self.samples)
-        # We only need the token path (t_path)
         t_path, _, _, s_i = self.samples[s_idx]
 
         tok_mmap = self._get_worker_mmap(t_path, np.uint32, (-1, self.seq_len))
@@ -626,7 +627,6 @@ def build_disjoint_train_val_datasets(
         vocab_size=vocab_size,
         eos_token_id=eos_token_id,
     )
-    # Validation strictly uses the EvalMemmapDataset for pure CE computation
     val_ds = EvalMemmapDataset(
         data_dir,
         seq_len=seq_len,
@@ -732,17 +732,17 @@ class TwoPhaseDistillTrainer(Trainer):
     ):
         super().__init__(*args, **kwargs)
         self.online_teacher_model = online_teacher_model
-        
+
         # Phase 1 Weights
         self.alpha_ce = alpha_ce
         self.alpha_kl = alpha_kl
         self.alpha_cos = alpha_cos
-        
+
         # Phase 2 Weights
         self.phase2_alpha_ce = phase2_alpha_ce
         self.phase2_alpha_kl = phase2_alpha_kl
         self.phase2_alpha_cos = phase2_alpha_cos
-        
+
         self.temperature = temperature
         self.phase1_steps = phase1_steps
         self.backbone_lr_ratio = backbone_lr_ratio
@@ -843,6 +843,13 @@ class TwoPhaseDistillTrainer(Trainer):
         if self.state.global_step < self.phase1_steps:
             for p in self.non_cslrad_params:
                 p.grad = None
+        elif not getattr(self, "_phase2_transition_logged", False):
+            if self.state.is_world_process_zero:
+                logger.info(
+                    f"\n🔓 [Transition] Reached step {self.state.global_step}: Entering Phase 2! "
+                    "Unfreezing backbone MLPs and beginning co-adaptation.\n"
+                )
+            self._phase2_transition_logged = True
 
         return loss
 
@@ -984,16 +991,23 @@ class TwoPhaseDistillTrainer(Trainer):
         loss_kl = (total_loss_kl / num_tokens) * (self.temperature**2)
 
         # ---------------------------------------------------------
-        # 4. Dynamic Composite Objective (Phase 1 vs Phase 2)
+        # Dynamic Loss Weights with Linear Transition Interpolation
         # ---------------------------------------------------------
         if self.state.global_step < self.phase1_steps:
             cur_alpha_ce = self.alpha_ce
             cur_alpha_kl = self.alpha_kl
             cur_alpha_cos = self.alpha_cos
         else:
-            cur_alpha_ce = self.phase2_alpha_ce
-            cur_alpha_kl = self.phase2_alpha_kl
-            cur_alpha_cos = self.phase2_alpha_cos
+            # Linearly interpolate over a 5% transition window to prevent gradient shock
+            p2_steps_total = max(1, self.args.max_steps - self.phase1_steps)
+            transition_window = max(1, int(p2_steps_total * 0.05))
+            steps_into_p2 = self.state.global_step - self.phase1_steps
+
+            progress = min(1.0, max(0.0, float(steps_into_p2) / float(transition_window)))
+
+            cur_alpha_ce = self.alpha_ce + (self.phase2_alpha_ce - self.alpha_ce) * progress
+            cur_alpha_kl = self.alpha_kl + (self.phase2_alpha_kl - self.alpha_kl) * progress
+            cur_alpha_cos = self.alpha_cos + (self.phase2_alpha_cos - self.alpha_cos) * progress
 
         total_loss = (cur_alpha_ce * loss_ce) + (cur_alpha_kl * loss_kl) + (cur_alpha_cos * loss_cos)
 
@@ -1059,43 +1073,43 @@ def main():
     parser.add_argument("--alpha_ce", type=float, default=0.35)
     parser.add_argument("--alpha_kl", type=float, default=0.35)
     parser.add_argument("--alpha_cos", type=float, default=0.30, help="Weight for layerwise cosine distance loss (Phase 1)")
-    
+
     # Phase 2 Distillation Parameters
     parser.add_argument("--phase2_alpha_ce", type=float, default=0.45)
     parser.add_argument("--phase2_alpha_kl", type=float, default=0.45)
     parser.add_argument("--phase2_alpha_cos", type=float, default=0.10, help="Weight for layerwise cosine distance loss (Phase 2)")
-    
+
     parser.add_argument("--temperature", type=float, default=1.0)
 
-    # Two-Phase Optimization (Tuned for 40BT Production Run)
+    # Two-Phase Optimization
     parser.add_argument(
         "--max_steps",
         type=int,
-        default=50862,  # ~40BT at batch_size=12, accum=4, seq_len=2048, 8 GPUs
+        default=50862,
         help="Total steps across both phases.",
     )
     parser.add_argument(
         "--phase1_steps",
         type=int,
-        default=6358,  # ~5BT dedicated to Phase 1 strict alignment
+        default=6358,
         help="Phase 1 steps: Only train CS-LRAD mixer layers (Backbone frozen).",
     )
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-4,  # Increased LR for CS-LRAD
+        default=5e-4,
         help="Base peak learning rate for CS-LRAD recurrent layers.",
     )
     parser.add_argument(
         "--backbone_lr_ratio",
         type=float,
-        default=0.10,  # 0.1 * 5e-4 = ~5e-5
+        default=0.10,
         help="Multiplier for MLPs and native Attention in Phase 2.",
     )
     parser.add_argument(
         "--emb_lr_ratio",
         type=float,
-        default=0.01,  # 0.01 * 5e-4 = ~5e-6
+        default=0.01,
         help="Multiplier for Embeddings and LM Head in Phase 2.",
     )
     parser.add_argument("--warmup_steps", type=int, default=500)
