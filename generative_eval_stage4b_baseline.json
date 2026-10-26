@@ -1,0 +1,15 @@
+{
+  "teacher": {
+    "gsm8k_cot": 36.4,
+    "mbpp_pass@1": 2.8000000000000003,
+    "mbpp_syntax_valid": 92.0,
+    "generative_macro_avg": 19.599999999999998
+  },
+  "student": {
+    "gsm8k_cot": 15.2,
+    "mbpp_pass@1": 0.8,
+    "mbpp_syntax_valid": 67.60000000000001,
+    "generative_macro_avg": 8.0
+  },
+  "student_ckpt": "./checkpoints/stage4b_dpo_2B_4k/best"
+}

@@ -1,0 +1,499 @@
+{
+  "arc_challenge": {
+    "metric": "acc_norm",
+    "teacher": 37.54266211604095,
+    "student": 30.631399317406142,
+    "delta": -6.911262798634809,
+    "retention_pct": 81.59090909090911
+  },
+  "arc_easy": {
+    "metric": "acc_norm",
+    "teacher": 61.40572390572391,
+    "student": 54.20875420875421,
+    "delta": -7.196969696969703,
+    "retention_pct": 88.27964359150103
+  },
+  "boolq": {
+    "metric": "acc",
+    "teacher": 62.477064220183486,
+    "student": 62.99694189602446,
+    "delta": 0.5198776758409736,
+    "retention_pct": 100.83210964268233
+  },
+  "hellaswag": {
+    "metric": "acc_norm",
+    "teacher": 49.60167297351125,
+    "student": 44.98107946624179,
+    "delta": -4.6205935072694615,
+    "retention_pct": 90.68460148564547
+  },
+  "lambada_openai": {
+    "metric": "acc",
+    "teacher": 43.66388511546672,
+    "student": 37.12400543372792,
+    "delta": -6.539879681738796,
+    "retention_pct": 85.02222222222221
+  },
+  "mmlu": {
+    "metric": "acc",
+    "teacher": 48.01310354650335,
+    "student": 34.731519726534685,
+    "delta": -13.281583819968667,
+    "retention_pct": 72.33758528626521
+  },
+  "mmlu_abstract_algebra": {
+    "metric": "acc",
+    "teacher": 30.0,
+    "student": 21.0,
+    "delta": -9.0,
+    "retention_pct": 70.0
+  },
+  "mmlu_anatomy": {
+    "metric": "acc",
+    "teacher": 50.37037037037037,
+    "student": 40.74074074074074,
+    "delta": -9.629629629629626,
+    "retention_pct": 80.88235294117648
+  },
+  "mmlu_astronomy": {
+    "metric": "acc",
+    "teacher": 47.368421052631575,
+    "student": 36.84210526315789,
+    "delta": -10.526315789473685,
+    "retention_pct": 77.77777777777779
+  },
+  "mmlu_business_ethics": {
+    "metric": "acc",
+    "teacher": 52.0,
+    "student": 38.0,
+    "delta": -14.0,
+    "retention_pct": 73.07692307692307
+  },
+  "mmlu_clinical_knowledge": {
+    "metric": "acc",
+    "teacher": 52.45283018867924,
+    "student": 39.24528301886793,
+    "delta": -13.207547169811313,
+    "retention_pct": 74.8201438848921
+  },
+  "mmlu_college_biology": {
+    "metric": "acc",
+    "teacher": 61.111111111111114,
+    "student": 30.555555555555557,
+    "delta": -30.555555555555557,
+    "retention_pct": 50.0
+  },
+  "mmlu_college_chemistry": {
+    "metric": "acc",
+    "teacher": 32.0,
+    "student": 32.0,
+    "delta": 0.0,
+    "retention_pct": 100.0
+  },
+  "mmlu_college_computer_science": {
+    "metric": "acc",
+    "teacher": 40.0,
+    "student": 34.0,
+    "delta": -6.0,
+    "retention_pct": 85.0
+  },
+  "mmlu_college_mathematics": {
+    "metric": "acc",
+    "teacher": 30.0,
+    "student": 27.0,
+    "delta": -3.0,
+    "retention_pct": 90.0
+  },
+  "mmlu_college_medicine": {
+    "metric": "acc",
+    "teacher": 47.398843930635834,
+    "student": 32.947976878612714,
+    "delta": -14.45086705202312,
+    "retention_pct": 69.51219512195121
+  },
+  "mmlu_college_physics": {
+    "metric": "acc",
+    "teacher": 27.450980392156865,
+    "student": 35.294117647058826,
+    "delta": 7.843137254901961,
+    "retention_pct": 128.57142857142858
+  },
+  "mmlu_computer_security": {
+    "metric": "acc",
+    "teacher": 63.0,
+    "student": 39.0,
+    "delta": -24.0,
+    "retention_pct": 61.904761904761905
+  },
+  "mmlu_conceptual_physics": {
+    "metric": "acc",
+    "teacher": 53.191489361702125,
+    "student": 34.46808510638298,
+    "delta": -18.723404255319146,
+    "retention_pct": 64.8
+  },
+  "mmlu_econometrics": {
+    "metric": "acc",
+    "teacher": 34.21052631578947,
+    "student": 24.561403508771928,
+    "delta": -9.649122807017545,
+    "retention_pct": 71.7948717948718
+  },
+  "mmlu_electrical_engineering": {
+    "metric": "acc",
+    "teacher": 54.48275862068965,
+    "student": 32.41379310344827,
+    "delta": -22.06896551724138,
+    "retention_pct": 59.49367088607595
+  },
+  "mmlu_elementary_mathematics": {
+    "metric": "acc",
+    "teacher": 36.77248677248677,
+    "student": 26.984126984126984,
+    "delta": -9.788359788359788,
+    "retention_pct": 73.38129496402878
+  },
+  "mmlu_formal_logic": {
+    "metric": "acc",
+    "teacher": 35.714285714285715,
+    "student": 29.365079365079367,
+    "delta": -6.349206349206348,
+    "retention_pct": 82.22222222222223
+  },
+  "mmlu_global_facts": {
+    "metric": "acc",
+    "teacher": 33.0,
+    "student": 21.0,
+    "delta": -12.0,
+    "retention_pct": 63.63636363636363
+  },
+  "mmlu_high_school_biology": {
+    "metric": "acc",
+    "teacher": 62.903225806451616,
+    "student": 40.64516129032258,
+    "delta": -22.25806451612904,
+    "retention_pct": 64.61538461538461
+  },
+  "mmlu_high_school_chemistry": {
+    "metric": "acc",
+    "teacher": 47.29064039408867,
+    "student": 28.57142857142857,
+    "delta": -18.7192118226601,
+    "retention_pct": 60.416666666666664
+  },
+  "mmlu_high_school_computer_science": {
+    "metric": "acc",
+    "teacher": 47.0,
+    "student": 32.0,
+    "delta": -15.0,
+    "retention_pct": 68.08510638297872
+  },
+  "mmlu_high_school_european_history": {
+    "metric": "acc",
+    "teacher": 61.81818181818181,
+    "student": 43.03030303030303,
+    "delta": -18.787878787878782,
+    "retention_pct": 69.6078431372549
+  },
+  "mmlu_high_school_geography": {
+    "metric": "acc",
+    "teacher": 52.02020202020202,
+    "student": 42.92929292929293,
+    "delta": -9.090909090909093,
+    "retention_pct": 82.52427184466019
+  },
+  "mmlu_high_school_government_and_politics": {
+    "metric": "acc",
+    "teacher": 55.44041450777202,
+    "student": 41.968911917098445,
+    "delta": -13.471502590673573,
+    "retention_pct": 75.70093457943925
+  },
+  "mmlu_high_school_macroeconomics": {
+    "metric": "acc",
+    "teacher": 45.8974358974359,
+    "student": 33.07692307692307,
+    "delta": -12.820512820512825,
+    "retention_pct": 72.06703910614524
+  },
+  "mmlu_high_school_mathematics": {
+    "metric": "acc",
+    "teacher": 27.40740740740741,
+    "student": 30.37037037037037,
+    "delta": 2.962962962962962,
+    "retention_pct": 110.8108108108108
+  },
+  "mmlu_high_school_microeconomics": {
+    "metric": "acc",
+    "teacher": 49.57983193277311,
+    "student": 37.39495798319328,
+    "delta": -12.184873949579831,
+    "retention_pct": 75.42372881355932
+  },
+  "mmlu_high_school_physics": {
+    "metric": "acc",
+    "teacher": 32.450331125827816,
+    "student": 33.11258278145696,
+    "delta": 0.6622516556291416,
+    "retention_pct": 102.04081632653062
+  },
+  "mmlu_high_school_psychology": {
+    "metric": "acc",
+    "teacher": 65.13761467889908,
+    "student": 46.60550458715596,
+    "delta": -18.53211009174312,
+    "retention_pct": 71.54929577464787
+  },
+  "mmlu_high_school_statistics": {
+    "metric": "acc",
+    "teacher": 30.09259259259259,
+    "student": 31.01851851851852,
+    "delta": 0.9259259259259274,
+    "retention_pct": 103.0769230769231
+  },
+  "mmlu_high_school_us_history": {
+    "metric": "acc",
+    "teacher": 52.94117647058824,
+    "student": 39.705882352941174,
+    "delta": -13.235294117647065,
+    "retention_pct": 74.99999999999999
+  },
+  "mmlu_high_school_world_history": {
+    "metric": "acc",
+    "teacher": 59.49367088607595,
+    "student": 43.88185654008439,
+    "delta": -15.611814345991554,
+    "retention_pct": 73.75886524822695
+  },
+  "mmlu_human_aging": {
+    "metric": "acc",
+    "teacher": 50.672645739910315,
+    "student": 32.28699551569507,
+    "delta": -18.385650224215247,
+    "retention_pct": 63.716814159292035
+  },
+  "mmlu_human_sexuality": {
+    "metric": "acc",
+    "teacher": 56.48854961832062,
+    "student": 36.6412213740458,
+    "delta": -19.84732824427482,
+    "retention_pct": 64.86486486486484
+  },
+  "mmlu_humanities": {
+    "metric": "acc",
+    "teacher": 44.22954303931987,
+    "student": 32.66737513283741,
+    "delta": -11.562167906482465,
+    "retention_pct": 73.85872176838059
+  },
+  "mmlu_international_law": {
+    "metric": "acc",
+    "teacher": 70.24793388429752,
+    "student": 46.28099173553719,
+    "delta": -23.96694214876033,
+    "retention_pct": 65.88235294117646
+  },
+  "mmlu_jurisprudence": {
+    "metric": "acc",
+    "teacher": 58.333333333333336,
+    "student": 38.88888888888889,
+    "delta": -19.444444444444443,
+    "retention_pct": 66.66666666666667
+  },
+  "mmlu_logical_fallacies": {
+    "metric": "acc",
+    "teacher": 61.34969325153374,
+    "student": 33.74233128834356,
+    "delta": -27.607361963190186,
+    "retention_pct": 54.99999999999999
+  },
+  "mmlu_machine_learning": {
+    "metric": "acc",
+    "teacher": 35.714285714285715,
+    "student": 31.25,
+    "delta": -4.464285714285715,
+    "retention_pct": 87.5
+  },
+  "mmlu_management": {
+    "metric": "acc",
+    "teacher": 62.13592233009708,
+    "student": 44.66019417475729,
+    "delta": -17.475728155339795,
+    "retention_pct": 71.87500000000001
+  },
+  "mmlu_marketing": {
+    "metric": "acc",
+    "teacher": 78.63247863247864,
+    "student": 49.14529914529914,
+    "delta": -29.487179487179496,
+    "retention_pct": 62.499999999999986
+  },
+  "mmlu_medical_genetics": {
+    "metric": "acc",
+    "teacher": 51.0,
+    "student": 49.0,
+    "delta": -2.0,
+    "retention_pct": 96.07843137254902
+  },
+  "mmlu_miscellaneous": {
+    "metric": "acc",
+    "teacher": 58.49297573435505,
+    "student": 34.61047254150703,
+    "delta": -23.88250319284802,
+    "retention_pct": 59.1703056768559
+  },
+  "mmlu_moral_disputes": {
+    "metric": "acc",
+    "teacher": 55.78034682080924,
+    "student": 35.54913294797688,
+    "delta": -20.231213872832363,
+    "retention_pct": 63.730569948186535
+  },
+  "mmlu_moral_scenarios": {
+    "metric": "acc",
+    "teacher": 25.027932960893857,
+    "student": 23.798882681564244,
+    "delta": -1.2290502793296127,
+    "retention_pct": 95.0892857142857
+  },
+  "mmlu_nutrition": {
+    "metric": "acc",
+    "teacher": 61.76470588235294,
+    "student": 42.810457516339866,
+    "delta": -18.954248366013076,
+    "retention_pct": 69.3121693121693
+  },
+  "mmlu_other": {
+    "metric": "acc",
+    "teacher": 52.49436755712906,
+    "student": 37.62471837785645,
+    "delta": -14.869649179272606,
+    "retention_pct": 71.67381974248927
+  },
+  "mmlu_philosophy": {
+    "metric": "acc",
+    "teacher": 57.234726688102896,
+    "student": 40.51446945337621,
+    "delta": -16.720257234726688,
+    "retention_pct": 70.7865168539326
+  },
+  "mmlu_prehistory": {
+    "metric": "acc",
+    "teacher": 49.382716049382715,
+    "student": 33.95061728395062,
+    "delta": -15.432098765432094,
+    "retention_pct": 68.75000000000001
+  },
+  "mmlu_professional_accounting": {
+    "metric": "acc",
+    "teacher": 36.52482269503546,
+    "student": 30.49645390070922,
+    "delta": -6.028368794326241,
+    "retention_pct": 83.49514563106796
+  },
+  "mmlu_professional_law": {
+    "metric": "acc",
+    "teacher": 37.74445893089961,
+    "student": 30.052151238591918,
+    "delta": -7.692307692307693,
+    "retention_pct": 79.62003454231433
+  },
+  "mmlu_professional_medicine": {
+    "metric": "acc",
+    "teacher": 33.455882352941174,
+    "student": 42.279411764705884,
+    "delta": 8.82352941176471,
+    "retention_pct": 126.3736263736264
+  },
+  "mmlu_professional_psychology": {
+    "metric": "acc",
+    "teacher": 47.385620915032675,
+    "student": 29.411764705882355,
+    "delta": -17.97385620915032,
+    "retention_pct": 62.068965517241395
+  },
+  "mmlu_public_relations": {
+    "metric": "acc",
+    "teacher": 48.18181818181818,
+    "student": 40.909090909090914,
+    "delta": -7.272727272727266,
+    "retention_pct": 84.9056603773585
+  },
+  "mmlu_security_studies": {
+    "metric": "acc",
+    "teacher": 61.63265306122449,
+    "student": 28.57142857142857,
+    "delta": -33.06122448979592,
+    "retention_pct": 46.35761589403973
+  },
+  "mmlu_social_sciences": {
+    "metric": "acc",
+    "teacher": 54.273643158921026,
+    "student": 37.276568085797855,
+    "delta": -16.99707507312317,
+    "retention_pct": 68.68263473053892
+  },
+  "mmlu_sociology": {
+    "metric": "acc",
+    "teacher": 63.681592039801,
+    "student": 45.77114427860697,
+    "delta": -17.91044776119403,
+    "retention_pct": 71.875
+  },
+  "mmlu_stem": {
+    "metric": "acc",
+    "teacher": 43.13352362829052,
+    "student": 32.477006026006976,
+    "delta": -10.656517602283543,
+    "retention_pct": 75.29411764705881
+  },
+  "mmlu_us_foreign_policy": {
+    "metric": "acc",
+    "teacher": 73.0,
+    "student": 46.0,
+    "delta": -27.0,
+    "retention_pct": 63.013698630136986
+  },
+  "mmlu_virology": {
+    "metric": "acc",
+    "teacher": 43.373493975903614,
+    "student": 38.55421686746988,
+    "delta": -4.819277108433731,
+    "retention_pct": 88.8888888888889
+  },
+  "mmlu_world_religions": {
+    "metric": "acc",
+    "teacher": 60.23391812865497,
+    "student": 33.91812865497076,
+    "delta": -26.315789473684212,
+    "retention_pct": 56.310679611650485
+  },
+  "openbookqa": {
+    "metric": "acc_norm",
+    "teacher": 31.2,
+    "student": 30.8,
+    "delta": -0.3999999999999986,
+    "retention_pct": 98.71794871794873
+  },
+  "piqa": {
+    "metric": "acc_norm",
+    "teacher": 69.26006528835691,
+    "student": 67.41022850924918,
+    "delta": -1.8498367791077328,
+    "retention_pct": 97.32914375490965
+  },
+  "sciq": {
+    "metric": "acc_norm",
+    "teacher": 86.4,
+    "student": 86.7,
+    "delta": 0.29999999999999716,
+    "retention_pct": 100.34722222222221
+  },
+  "winogrande": {
+    "metric": "acc",
+    "teacher": 58.08997632202052,
+    "student": 53.196527229676406,
+    "delta": -4.893449092344113,
+    "retention_pct": 91.57608695652175
+  }
+}

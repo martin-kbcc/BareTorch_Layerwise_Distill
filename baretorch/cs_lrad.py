@@ -3,27 +3,32 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, d_model, eps=1e-6):
+    def __init__(self, d_model, eps=1e-6, unit_offset=False):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d_model))
+        self.unit_offset = unit_offset
+        init_val = torch.zeros(d_model) if unit_offset else torch.ones(d_model)
+        self.weight = nn.Parameter(init_val)
 
     def forward(self, x):
         input_dtype = x.dtype
         x_fp32 = x.to(torch.float32)
         variance = x_fp32.pow(2).mean(-1, keepdim=True)
         x_norm = x_fp32 * torch.rsqrt(variance + self.eps)
-        return (x_norm * self.weight.to(torch.float32)).to(input_dtype)
+        w_fp32 = (1.0 + self.weight.to(torch.float32)) if self.unit_offset else self.weight.to(torch.float32)
+        return (x_norm * w_fp32).to(input_dtype)
 
 
 class GatedMLP(nn.Module):
-    def __init__(self, d_model, d_ff, dropout=0.1):
+    def __init__(self, d_model, d_ff=None, dropout=0.0):
         super().__init__()
+        d_ff = d_ff if d_ff is not None else int(d_model * 3.5)
         self.w1 = nn.Linear(d_model, d_ff, bias=False)
         self.w2 = nn.Linear(d_model, d_ff, bias=False)
         self.w3 = nn.Linear(d_ff, d_model, bias=False)
@@ -34,7 +39,7 @@ class GatedMLP(nn.Module):
 
 
 class LowRankAssociativeDeltaEngine(nn.Module):
-    def __init__(self, d_model=256, num_heads=16, chunk_size=32, rank=8, dropout=0.1):
+    def __init__(self, d_model=256, num_heads=16, chunk_size=32, rank=8, dropout=0.0):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -57,6 +62,23 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         self.W_swish_gate = nn.Linear(d_model, self.inner_dim, bias=False)
         self.W_out = nn.Linear(self.inner_dim, d_model, bias=False)
         self.resid_drop = nn.Dropout(dropout)
+
+    def _init_gate_parameters(self):
+        """
+        Custom initialization for associative memory gates:
+        - W_gate bias initialized to +2.5 (sigmoid(2.5) ~ 0.924) so chunk memory does not vanish at step 0.
+        - W_beta_gate bias initialized to -1.0 for gentle initial delta state updates.
+        - Orthogonal initialization for low-rank U and R projections (computed in fp32 for CPU bf16 compatibility).
+        """
+        nn.init.zeros_(self.W_gate.weight)
+        nn.init.constant_(self.W_gate.bias, 2.5)
+        nn.init.zeros_(self.W_beta_gate.weight)
+        nn.init.constant_(self.W_beta_gate.bias, -1.0)
+
+        for proj in (self.W_u, self.W_r):
+            w_fp32 = torch.empty_like(proj.weight, dtype=torch.float32)
+            nn.init.orthogonal_(w_fp32, gain=0.5)
+            proj.weight.data.copy_(w_fp32.to(proj.weight.dtype))
 
     def chunk_forward(self, x, attention_mask=None, use_cache=False):
         B, L, D = x.shape
@@ -145,12 +167,21 @@ class LowRankAssociativeDeltaEngine(nn.Module):
 
         next_cache = None
         if use_cache:
-            chunk_decay_last = exp_Lambda[:, :, -1, -1:, :]
-            S_historical_last = S_historical[:, :, -1]
-            S_local_last = torch.matmul(U_decayed[:, :, -1].transpose(-1, -2), V_fp32[:, :, -1])
-            S_final = (chunk_decay_last * S_historical_last) + S_local_last
-            S_final = torch.clamp(S_final, min=-50.0, max=50.0)
-            next_cache = (S_final, None, None, None, None, L)
+            rem = L % C
+            if rem == 0:
+                chunk_decay_last = exp_Lambda[:, :, -1, -1:, :]
+                S_historical_last = S_historical[:, :, -1]
+                S_local_last = torch.matmul(U_decayed[:, :, -1].transpose(-1, -2), V_fp32[:, :, -1])
+                S_final = (chunk_decay_last * S_historical_last) + S_local_last
+                S_final = torch.clamp(S_final, min=-50.0, max=50.0)
+                next_cache = (S_final, None, None, None, None, L)
+            else:
+                S_prev_chunks = torch.clamp(S_historical[:, :, -1], min=-50.0, max=50.0)
+                buf_k = K[:, :, -1, :rem, :].float().contiguous()
+                buf_v = V_fp32[:, :, -1, :rem, :].contiguous()
+                buf_u = (U_fp32[:, :, -1, :rem, :] * beta_gate_fp32[:, :, -1, :rem, :]).contiguous()
+                buf_lambda = Lambda[:, :, -1, :rem, :].contiguous()
+                next_cache = (S_prev_chunks, buf_k, buf_v, buf_u, buf_lambda, L)
 
         return output, next_cache
 
@@ -247,23 +278,43 @@ class LowRankAssociativeDeltaEngine(nn.Module):
 
 
 class LRADDecoderBlock(nn.Module):
-    def __init__(self, d_model, num_heads, chunk_size=32, rank=8, dropout=0.1, use_grad_checkpointing=False):
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        d_ff=None,
+        chunk_size=32,
+        rank=8,
+        dropout=0.0,
+        rms_norm_eps=1e-6,
+        rms_norm_unit_offset=False,
+        use_grad_checkpointing=False,
+    ):
         super().__init__()
         self.use_grad_checkpointing = use_grad_checkpointing
-        self.ln1 = RMSNorm(d_model)
-        self.attn = LowRankAssociativeDeltaEngine(d_model, num_heads, chunk_size=chunk_size, rank=rank, dropout=dropout)
-        self.ln2 = RMSNorm(d_model)
-        self.mlp = GatedMLP(d_model, d_ff=int(d_model * 3.5), dropout=dropout)
+        self.ln1 = RMSNorm(d_model, eps=rms_norm_eps, unit_offset=rms_norm_unit_offset)
+        self.attn = LowRankAssociativeDeltaEngine(
+            d_model, num_heads, chunk_size=chunk_size, rank=rank, dropout=dropout
+        )
+        self.ln2 = RMSNorm(d_model, eps=rms_norm_eps, unit_offset=rms_norm_unit_offset)
+        self.mlp = GatedMLP(d_model, d_ff=d_ff, dropout=dropout)
 
     def forward(self, x, past_state=None, use_cache=False, attention_mask=None):
-        h_attn = self.ln1(x)
-        attn_out, next_state = self.attn(h_attn, past_state=past_state, use_cache=use_cache, attention_mask=attention_mask)
+        def _block_forward(x_in, p_state, u_cache, attn_mask):
+            h_attn = self.ln1(x_in)
+            attn_out, next_state = self.attn(
+                h_attn, past_state=p_state, use_cache=u_cache, attention_mask=attn_mask
+            )
+            x_out = x_in + attn_out
+            x_out = x_out + self.mlp(self.ln2(x_out))
+            cache_out = next_state if u_cache else None
+            return x_out, cache_out
 
-        x_out = x + attn_out
-        x_out = x_out + self.mlp(self.ln2(x_out))
-
-        cache_out = next_state if use_cache else None
-        return x_out, cache_out
+        if self.use_grad_checkpointing and self.training and not use_cache:
+            return checkpoint.checkpoint(
+                _block_forward, x, past_state, use_cache, attention_mask, use_reentrant=False
+            )
+        return _block_forward(x, past_state, use_cache, attention_mask)
 
 
 class CSLRADConfig(PretrainedConfig):
@@ -276,9 +327,13 @@ class CSLRADConfig(PretrainedConfig):
         d_model=256,
         num_heads=16,
         num_layers=8,
+        intermediate_size=None,
         chunk_size=32,
         rank=8,
-        dropout=0.1,
+        dropout=0.0,
+        rms_norm_eps=1e-6,
+        rms_norm_unit_offset=False,
+        logit_soft_cap=None,
         use_grad_checkpointing=False,
         pad_token_id=0,
         bos_token_id=1,
@@ -295,9 +350,13 @@ class CSLRADConfig(PretrainedConfig):
         self.d_model = d_model
         self.num_heads = num_heads
         self.num_layers = num_layers
+        self.intermediate_size = intermediate_size
         self.chunk_size = chunk_size
         self.rank = rank
         self.dropout = dropout
+        self.rms_norm_eps = rms_norm_eps
+        self.rms_norm_unit_offset = rms_norm_unit_offset
+        self.logit_soft_cap = logit_soft_cap
         self.use_grad_checkpointing = use_grad_checkpointing
 
 
@@ -313,6 +372,8 @@ class CSLRADPreTrainedModel(PreTrainedModel):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, LowRankAssociativeDeltaEngine):
+            module._init_gate_parameters()
 
 
 class CSLRADModel(CSLRADPreTrainedModel):
@@ -320,18 +381,26 @@ class CSLRADModel(CSLRADPreTrainedModel):
         super().__init__(config)
         self.config = config
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        unit_offset = getattr(config, "rms_norm_unit_offset", False)
         self.layers = nn.ModuleList([
             LRADDecoderBlock(
                 d_model=config.d_model,
                 num_heads=config.num_heads,
+                d_ff=getattr(config, "intermediate_size", None),
                 chunk_size=config.chunk_size,
                 rank=config.rank,
                 dropout=config.dropout,
+                rms_norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                rms_norm_unit_offset=unit_offset,
                 use_grad_checkpointing=config.use_grad_checkpointing,
             )
             for _ in range(config.num_layers)
         ])
-        self.final_norm = RMSNorm(config.d_model)
+        self.final_norm = RMSNorm(
+            config.d_model,
+            eps=getattr(config, "rms_norm_eps", 1e-6),
+            unit_offset=unit_offset,
+        )
         self.post_init()
 
     def get_input_embeddings(self):
@@ -357,7 +426,7 @@ class CSLRADModel(CSLRADPreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else bool(getattr(self.config, "return_dict", True))
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -445,7 +514,7 @@ class CSLRADForCausalLM(CSLRADPreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
     ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else bool(getattr(self.config, "return_dict", True))
 
         outputs = self.model(
             input_ids=input_ids,
@@ -461,13 +530,16 @@ class CSLRADForCausalLM(CSLRADPreTrainedModel):
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        logits = 30.0 * torch.tanh(logits / 30.0)
+
+        soft_cap = getattr(self.config, "logit_soft_cap", None)
+        if soft_cap is not None and soft_cap > 0.0:
+            logits = soft_cap * torch.tanh(logits / soft_cap)
 
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
         if not return_dict:
