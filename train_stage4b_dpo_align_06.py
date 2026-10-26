@@ -278,7 +278,6 @@ def prepare_or_load_dpo_dataset(args, tokenizer, accelerator):
                         if ctx_a and len(endings) == 4 and lbl in ("0", "1", "2", "3"):
                             ans_idx = int(lbl)
                             ctx_b_cap = (ctx_b[0].upper() + ctx_b[1:]) if ctx_b else ""
-                            # Exact lm_eval HellaSwag doc_to_text formatting:
                             full_ctx = f"{act_label}: {ctx_a} {ctx_b_cap}".strip() if act_label else f"{ctx_a} {ctx_b_cap}".strip()
                             chosen_end = str(endings[ans_idx]).strip()
                             dist_indices = [i for i in range(4) if i != ans_idx and str(endings[i]).strip()]
@@ -316,7 +315,6 @@ def prepare_or_load_dpo_dataset(args, tokenizer, accelerator):
                         if goal and sol1 and sol2 and int(lbl) in (0, 1):
                             chosen_sol = sol1 if int(lbl) == 0 else sol2
                             rej_sol = sol2 if int(lbl) == 0 else sol1
-                            # Exact lm_eval PIQA format: `Question: <goal>\nAnswer: <sol>`
                             yield {
                                 "prompt": f"Question: {goal}\nAnswer:",
                                 "chosen": f" {chosen_sol}",
@@ -435,7 +433,6 @@ def prepare_or_load_dpo_dataset(args, tokenizer, accelerator):
                         c_full = tokenizer(c_str, add_special_tokens=False)["input_ids"] + [eos_id]
                         r_full = tokenizer(r_str, add_special_tokens=False)["input_ids"] + [eos_id]
 
-                    # Never cut a chosen or rejected sequence in half
                     if len(c_full) > max_len or len(r_full) > max_len:
                         continue
                     p_len = len(p_ids)
@@ -451,7 +448,6 @@ def prepare_or_load_dpo_dataset(args, tokenizer, accelerator):
                     else:
                         ans_w = 1.0
 
-                    # Build padded chosen sequence + labels + focal/cross-chunk valid_mask
                     c_rem = max_len - len(c_full)
                     c_pad = c_full + [eos_id] * c_rem
                     c_lbl = [-100] * p_len + c_full[p_len:] + [-100] * c_rem
@@ -464,7 +460,6 @@ def prepare_or_load_dpo_dataset(args, tokenizer, accelerator):
                         c_vmask.append(w)
                     c_vmask.extend([0.0] * c_rem)
 
-                    # Build padded rejected sequence + labels
                     r_rem = max_len - len(r_full)
                     r_pad = r_full + [eos_id] * r_rem
                     r_lbl = [-100] * p_len + r_full[p_len:] + [-100] * r_rem
@@ -755,11 +750,32 @@ def evaluate_stage4b(accelerator, wrapper, ref_student, teacher, t_backbone, val
     return means[0], means[1], means[2], means[3], means[4], means[5]
 
 
+def save_student_checkpoint_clean(unwrapped_student, tokenizer, save_dir: str):
+    """
+    Saves the student checkpoint while ensuring `gradient_checkpointing` is persisted
+    as `False` in `config.json` so downstream stages (4C, evaluations) do not inherit an
+    active gradient checkpointing flag when running with `--no_grad_checkpointing` + `torch.compile`.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    orig_gc = getattr(unwrapped_student.config, "gradient_checkpointing", False)
+    unwrapped_student.config.gradient_checkpointing = False
+    unwrapped_student.config.save_pretrained(save_dir)
+    unwrapped_student.config.gradient_checkpointing = orig_gc
+    tokenizer.save_pretrained(save_dir)
+    torch.save(unwrapped_student.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
-    use_compile = not args.no_compile
     use_gc = not args.no_grad_checkpointing
+    # CRITICAL FIX: Never combine torch.compile inside LRADDecoderBlock with gradient_checkpointing_enable(),
+    # and explicitly disable any inherited gradient_checkpointing flag from config.json when use_gc=False!
+    use_compile = (not args.no_compile) and (not use_gc)
+
+    if hasattr(torch._C, "_dynamo") and hasattr(torch._C._dynamo.eval_frame, "_set_lru_cache"):
+        torch._C._dynamo.eval_frame._set_lru_cache(False)
+
     accelerator = Accelerator(mixed_precision="bf16", gradient_accumulation_steps=args.grad_accum_steps)
 
     ckpt_to_load = args.stage4a_ckpt_dir
@@ -774,16 +790,35 @@ def main():
     val_ds = ds_dict["validation"]
     seq_len = len(train_ds[0]["chosen_ids"])
 
-    # 2. Reconstruct 0.67B Policy Student AND Frozen Reference Student from Stage 4A Best Checkpoint
-    _, base_08b_backbone, _ = load_qwen3_5_text_teacher(args.student_base_id, dtype=torch.bfloat16, device="cpu")
-    student = load_hybrid_student_checkpoint(
-        ckpt_to_load, teacher_backbone=base_08b_backbone, teacher_id=args.student_base_id, dtype=torch.bfloat16
-    )
-    del base_08b_backbone
-    gc.collect()
+    # 2. Load DPO Teacher & Reconstruct Student + Frozen Reference Student (single load if teacher_id == student_base_id!)
+    if accelerator.is_main_process:
+        print(f"Loading Larger DPO + Top-{args.topk_logits} Skew-KD Teacher: {args.teacher_id} ...")
+    teacher, t_backbone, _ = load_qwen3_5_text_teacher(args.teacher_id, dtype=torch.bfloat16, device="cpu")
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    if args.student_base_id == args.teacher_id:
+        student = load_hybrid_student_checkpoint(
+            ckpt_to_load, teacher_backbone=t_backbone, teacher_id=args.teacher_id, dtype=torch.bfloat16
+        )
+    else:
+        _, base_08b_backbone, _ = load_qwen3_5_text_teacher(args.student_base_id, dtype=torch.bfloat16, device="cpu")
+        student = load_hybrid_student_checkpoint(
+            ckpt_to_load, teacher_backbone=base_08b_backbone, teacher_id=args.student_base_id, dtype=torch.bfloat16
+        )
+        del base_08b_backbone
+        gc.collect()
 
     if getattr(student.config, "tie_word_embeddings", True):
         student.lm_head.weight = student.model.token_embedding.weight
+
+    # Explicitly disable gradient checkpointing on student BEFORE copying ref_student so ref_student is always clean
+    if hasattr(student, "gradient_checkpointing_disable"):
+        student.gradient_checkpointing_disable()
+    student.config.gradient_checkpointing = False
+    if hasattr(student, "model"):
+        student.model.gradient_checkpointing = False
 
     ref_student = copy.deepcopy(student)
     ref_student.eval()
@@ -792,13 +827,6 @@ def main():
 
     if use_gc:
         student.gradient_checkpointing_enable()
-
-    if accelerator.is_main_process:
-        print(f"Loading Larger DPO + Top-{args.topk_logits} Skew-KD Teacher: {args.teacher_id} ...")
-    teacher, t_backbone, _ = load_qwen3_5_text_teacher(args.teacher_id, dtype=torch.bfloat16, device="cpu")
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
 
     if use_compile:
         for m in (student, ref_student):
@@ -869,6 +897,8 @@ def main():
         print(f"  - Train / Val Pairs    : {len(train_ds):,} train | {len(val_ds):,} val")
         print(f"  - Epochs Covered       : {epochs_covered:.2f} epochs ({args.max_steps:,} steps / {len(train_ds)//pairs_per_step:,} max unique steps)")
         print(f"  - Decoupled LRs        : LRAD={args.lrad_lr:.2e} | Backbone={args.backbone_lr:.2e}")
+        print(f"  - Gradient Checkpoint  : {'ENABLED' if use_gc else 'DISABLED'}")
+        print(f"  - torch.compile CS-LRAD: {'ENABLED (' + args.compile_mode + ')' if use_compile else 'DISABLED'}")
         print(f"  - Loss Formulation     : {args.dpo_weight}*Teacher_DPO(beta={args.beta}) + {args.skew_kd_weight}*Top{args.topk_logits}_SkewKD + {args.nll_weight}*Focal_NLL")
         print(f"  - Global Batch Size    : {pairs_per_step} pairs/step ({tokens_per_step:,} tok/step)")
         print(f"  - Validation Scope     : {val_scope}")
@@ -989,11 +1019,8 @@ def main():
                         if val_loss < best_val_loss:
                             best_val_loss = val_loss
                             best_dir = os.path.join(args.output_dir, "best")
-                            os.makedirs(best_dir, exist_ok=True)
                             unwrapped = accelerator.unwrap_model(wrapper).student
-                            unwrapped.config.save_pretrained(best_dir)
-                            tokenizer.save_pretrained(best_dir)
-                            torch.save(unwrapped.state_dict(), os.path.join(best_dir, "pytorch_model.bin"))
+                            save_student_checkpoint_clean(unwrapped, tokenizer, best_dir)
                             print(f"  >>> New Best Stage 4B Val Loss ({best_val_loss:.4f})! Saved to {best_dir}")
                     accelerator.wait_for_everyone()
                     t0 = time.time()
@@ -1002,11 +1029,8 @@ def main():
                 if step % args.save_steps == 0 or step >= args.max_steps:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
-                        os.makedirs(args.output_dir, exist_ok=True)
                         unwrapped = accelerator.unwrap_model(wrapper).student
-                        unwrapped.config.save_pretrained(args.output_dir)
-                        tokenizer.save_pretrained(args.output_dir)
-                        torch.save(unwrapped.state_dict(), os.path.join(args.output_dir, "pytorch_model.bin"))
+                        save_student_checkpoint_clean(unwrapped, tokenizer, args.output_dir)
                         print(f"  --> Saved Latest Stage 4B checkpoint at step {step} to {args.output_dir}")
                     accelerator.wait_for_everyone()
                     t0 = time.time()

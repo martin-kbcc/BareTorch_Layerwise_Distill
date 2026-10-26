@@ -344,11 +344,8 @@ def prepare_or_load_sft_dataset(args, tokenizer, accelerator):
                             prefix_clean = prefix.rstrip()
                             target_continuation = f" {chosen_opt}{suffix}"
                             if len(prefix_clean) >= 6:
-                                # Exact lm_eval Winogrande cloze continuation format:
-                                # lm_eval scores log P(chosen_opt + suffix | prefix)
                                 yield {"user": prefix_clean, "assistant": target_continuation, "mode": "raw_completion"}
                                 comp_cnt += 1
-                                # Also emit A/B multiple-choice format on 50% of examples
                                 if c_wino % 2 == 0:
                                     mc_p = f"Fill in the blank:\n{sent}\nA. {opt1}\nB. {opt2}\nAnswer:"
                                     yield {"user": mc_p, "assistant": f" {chosen_let}", "mode": "mmlu_raw"}
@@ -358,12 +355,17 @@ def prepare_or_load_sft_dataset(args, tokenizer, accelerator):
                 except Exception as e:
                     print(f"  [Warning] Could not stream `allenai/winogrande`: {e}")
 
-                # 1E. PIQA Physical Commonsense train split (16,113 physical goal-solution pairs)
+                # 1E. PIQA Physical Commonsense train split (16,113 physical goal-solution pairs via Parquet)
                 try:
                     try:
-                        piqa_ds = load_dataset("ybisk/piqa", split="train", streaming=True, trust_remote_code=True)
+                        piqa_ds = load_dataset(
+                            "parquet",
+                            data_files="hf://datasets/ybisk/piqa@refs/convert/parquet/plain_text/train/*.parquet",
+                            split="train",
+                            streaming=True,
+                        )
                     except Exception:
-                        piqa_ds = load_dataset("piqa", split="train", streaming=True)
+                        piqa_ds = load_dataset("ybisk/piqa", split="train", streaming=True)
                     c_piqa = 0
                     for item in piqa_ds:
                         goal = item.get("goal", "").strip()
@@ -373,10 +375,8 @@ def prepare_or_load_sft_dataset(args, tokenizer, accelerator):
                         if goal and sol1 and sol2 and int(lbl) in (0, 1):
                             chosen_sol = sol1 if int(lbl) == 0 else sol2
                             chosen_let = "A" if int(lbl) == 0 else "B"
-                            # 1. Exact lm_eval PIQA format (`Goal` -> ` Solution`)
                             yield {"user": f"Question: {goal}\nAnswer:", "assistant": f" {chosen_sol}", "mode": "arc_raw"}
                             arc_cnt += 1
-                            # 2. A/B MC format
                             mc_p = f"{goal}\nA. {sol1}\nB. {sol2}\nAnswer:"
                             yield {"user": mc_p, "assistant": f" {chosen_let}", "mode": "mmlu_raw"}
                             mmlu_cnt += 1
@@ -507,11 +507,9 @@ def prepare_or_load_sft_dataset(args, tokenizer, accelerator):
 
                 for idx, (u_txt, a_txt, mode) in enumerate(zip(users, assistants, modes)):
                     if mode in ("mmlu_raw", "arc_raw", "raw_completion"):
-                        # Exact zero-shot MMLU, ARC, or Winogrande Cloze completion format
                         p_ids = tokenizer(u_txt, add_special_tokens=False)["input_ids"]
                         f_ids = tokenizer(u_txt + a_txt, add_special_tokens=False)["input_ids"] + [eos_id]
                     elif (idx % 7 == 0) and has_chat_tmpl:
-                        # 15% Official Chat Template format (retains interactive chat ability)
                         p_ids = tokenizer.apply_chat_template(
                             [{"role": "user", "content": u_txt}], tokenize=True, add_generation_prompt=True
                         )
@@ -521,13 +519,11 @@ def prepare_or_load_sft_dataset(args, tokenizer, accelerator):
                             add_generation_prompt=False,
                         )
                     else:
-                        # 85% Clean Zero-Shot Q&A format (matches `lm_eval` zero-shot formatting!)
                         p_str = f"Question: {u_txt.strip()}\nAnswer:"
                         f_str = f"Question: {u_txt.strip()}\nAnswer: {a_txt.strip()}"
                         p_ids = tokenizer(p_str, add_special_tokens=False)["input_ids"]
                         f_ids = tokenizer(f_str, add_special_tokens=False)["input_ids"] + [eos_id]
 
-                    # Never cut an observation in half: skip single conversations exceeding seq_len
                     if len(f_ids) > seq_len or len(f_ids) < 4:
                         continue
 
@@ -538,7 +534,6 @@ def prepare_or_load_sft_dataset(args, tokenizer, accelerator):
 
                     lbls = [-100] * p_len + f_ids[p_len:]
 
-                    # Base Focal Answer-Token Importance Weight
                     if mode == "mmlu_raw":
                         ans_w = mc_w
                     elif mode in ("arc_raw", "raw_completion") or resp_len <= 32:
@@ -546,7 +541,6 @@ def prepare_or_load_sft_dataset(args, tokenizer, accelerator):
                     else:
                         ans_w = 1.0
 
-                    # Determine bin start offset so we know which 64-token CS-LRAD chunks this example spans
                     if len(cur_ids) + len(f_ids) > seq_len:
                         flush_bin(cur_ids, cur_lbls, cur_mask)
                         cur_ids, cur_lbls, cur_mask = [], [], []
@@ -554,8 +548,6 @@ def prepare_or_load_sft_dataset(args, tokenizer, accelerator):
                     bin_start_pos = len(cur_ids)
                     prompt_start_chunk = bin_start_pos // lrad_c
 
-                    # Apply Cross-Chunk Boundary Multiplier (`cc_w`) whenever a token sits in a later
-                    # 64-token chunk than the start of its question (forcing retrieval via S_historical!)
                     token_weights = []
                     for local_i in range(len(f_ids)):
                         abs_pos = bin_start_pos + local_i
@@ -598,7 +590,6 @@ def prepare_or_load_sft_dataset(args, tokenizer, accelerator):
                     f"with 2.0x Cross-Chunk Boundary weights..."
                 )
 
-                # Precompute the 2048-token mask where the first 16 tokens after every 64-token boundary get 2.0x weight
                 fw_boundary_mask = [
                     2.0 if (pos >= lrad_c and (pos % lrad_c) < 16) else 1.0
                     for pos in range(seq_len)
@@ -693,10 +684,8 @@ def chunked_sft_kl_and_masked_ce_loss(
         kl = (token_kl * vmask_c).sum() / valid_kl_denom
 
         if (labels_c != -100).any():
-            # Unweighted CE for telemetry logging
             with torch.no_grad():
                 ce_s_raw = F.cross_entropy(logits_s.reshape(-1, logits_s.size(-1)), labels_c.reshape(-1), ignore_index=-100)
-            # Focal-weighted CE for gradient backpropagation
             per_tok_ce = F.cross_entropy(
                 logits_s.reshape(-1, logits_s.size(-1)), labels_c.reshape(-1), ignore_index=-100, reduction="none"
             ).view_as(labels_c)
@@ -811,11 +800,32 @@ def evaluate_stage4a(accelerator, wrapper, teacher, t_backbone, val_loader, args
     return means[0], means[1], means[2], means[3]
 
 
+def save_student_checkpoint_clean(unwrapped_student, tokenizer, save_dir: str):
+    """
+    Saves the student checkpoint while ensuring `gradient_checkpointing` is persisted
+    as `False` in `config.json` so downstream stages (4B, 4C) do not inherit an
+    active gradient checkpointing flag when running with `--no_grad_checkpointing` + `torch.compile`.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    orig_gc = getattr(unwrapped_student.config, "gradient_checkpointing", False)
+    unwrapped_student.config.gradient_checkpointing = False
+    unwrapped_student.config.save_pretrained(save_dir)
+    unwrapped_student.config.gradient_checkpointing = orig_gc
+    tokenizer.save_pretrained(save_dir)
+    torch.save(unwrapped_student.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
-    use_compile = not args.no_compile
     use_gc = not args.no_grad_checkpointing
+    # CRITICAL FIX: Never combine torch.compile inside LRADDecoderBlock with gradient_checkpointing_enable(),
+    # and explicitly disable any inherited gradient_checkpointing flag from Stage 3B's config.json when use_gc=False!
+    use_compile = (not args.no_compile) and (not use_gc)
+
+    if hasattr(torch._C, "_dynamo") and hasattr(torch._C._dynamo.eval_frame, "_set_lru_cache"):
+        torch._C._dynamo.eval_frame._set_lru_cache(False)
+
     accelerator = Accelerator(mixed_precision="bf16", gradient_accumulation_steps=args.grad_accum_steps)
 
     ckpt_to_load = args.stage3_ckpt_dir
@@ -830,26 +840,38 @@ def main():
     val_ds = ds_dict["validation"]
     seq_len = len(train_ds[0]["input_ids"])
 
-    # 2. Reconstruct 0.67B Student from 0.8B structure, then load ANY Qwen3.5 Teacher (0.8B, 2B, or 4B!)
-    _, base_08b_backbone, _ = load_qwen3_5_text_teacher(args.student_base_id, dtype=torch.bfloat16, device="cpu")
-    student = load_hybrid_student_checkpoint(
-        ckpt_to_load, teacher_backbone=base_08b_backbone, teacher_id=args.student_base_id, dtype=torch.bfloat16
-    )
-    del base_08b_backbone
-    gc.collect()
-
-    if getattr(student.config, "tie_word_embeddings", True):
-        student.lm_head.weight = student.model.token_embedding.weight
-
-    if use_gc:
-        student.gradient_checkpointing_enable()
-
+    # 2. Load Up-Distillation Teacher & Reconstruct Student (single load if teacher_id == student_base_id!)
     if accelerator.is_main_process:
         print(f"Loading Up-Distillation Teacher: {args.teacher_id} ...")
     teacher, t_backbone, _ = load_qwen3_5_text_teacher(args.teacher_id, dtype=torch.bfloat16, device="cpu")
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
+
+    if args.student_base_id == args.teacher_id:
+        student = load_hybrid_student_checkpoint(
+            ckpt_to_load, teacher_backbone=t_backbone, teacher_id=args.teacher_id, dtype=torch.bfloat16
+        )
+    else:
+        _, base_08b_backbone, _ = load_qwen3_5_text_teacher(args.student_base_id, dtype=torch.bfloat16, device="cpu")
+        student = load_hybrid_student_checkpoint(
+            ckpt_to_load, teacher_backbone=base_08b_backbone, teacher_id=args.student_base_id, dtype=torch.bfloat16
+        )
+        del base_08b_backbone
+        gc.collect()
+
+    if getattr(student.config, "tie_word_embeddings", True):
+        student.lm_head.weight = student.model.token_embedding.weight
+
+    # Explicitly enforce gradient checkpointing state regardless of what was saved in Stage 3B's config.json!
+    if use_gc:
+        student.gradient_checkpointing_enable()
+    else:
+        if hasattr(student, "gradient_checkpointing_disable"):
+            student.gradient_checkpointing_disable()
+        student.config.gradient_checkpointing = False
+        if hasattr(student, "model"):
+            student.model.gradient_checkpointing = False
 
     if use_compile:
         for layer in student.model.layers:
@@ -1010,11 +1032,8 @@ def main():
                         if val_loss < best_val_loss:
                             best_val_loss = val_loss
                             best_dir = os.path.join(args.output_dir, "best")
-                            os.makedirs(best_dir, exist_ok=True)
                             unwrapped = accelerator.unwrap_model(wrapper).student
-                            unwrapped.config.save_pretrained(best_dir)
-                            tokenizer.save_pretrained(best_dir)
-                            torch.save(unwrapped.state_dict(), os.path.join(best_dir, "pytorch_model.bin"))
+                            save_student_checkpoint_clean(unwrapped, tokenizer, best_dir)
                             print(f"  >>> New Best Stage 4A Val Loss ({best_val_loss:.4f})! Saved to {best_dir}")
                     accelerator.wait_for_everyone()
                     t0 = time.time()
@@ -1023,11 +1042,8 @@ def main():
                 if step % args.save_steps == 0 or step >= args.max_steps:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
-                        os.makedirs(args.output_dir, exist_ok=True)
                         unwrapped = accelerator.unwrap_model(wrapper).student
-                        unwrapped.config.save_pretrained(args.output_dir)
-                        tokenizer.save_pretrained(args.output_dir)
-                        torch.save(unwrapped.state_dict(), os.path.join(args.output_dir, "pytorch_model.bin"))
+                        save_student_checkpoint_clean(unwrapped, tokenizer, args.output_dir)
                         print(f"  --> Saved Latest Stage 4A checkpoint at step {step} to {args.output_dir}")
                     accelerator.wait_for_everyone()
                     t0 = time.time()

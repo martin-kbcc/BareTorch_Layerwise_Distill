@@ -30,7 +30,7 @@ torch.set_float32_matmul_precision("high")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Stage 4C: Gold-Injected Contrastive Dr. GRPO + On-Policy Top-64 Skew-KD for Math (GSM8K) & Code (MBPP)"
+        description="Stage 4C: <think>-Guided Dr. GRPO + On-Policy Top-64 Skew-KD for Math (GSM8K) & Code (MBPP)"
     )
     parser.add_argument("--teacher_id", type=str, default="Qwen/Qwen3.5-2B", help="Larger Teacher for Top-64 Skew-KD")
     parser.add_argument("--student_base_id", type=str, default="Qwen/Qwen3.5-0.8B", help="Base model ID for Student structure")
@@ -50,22 +50,22 @@ def parse_args():
     # GRPO Rollout & Optimization Hyperparameters
     parser.add_argument("--group_size", type=int, default=4, help="Number of rollouts G per prompt")
     parser.add_argument("--max_prompt_len", type=int, default=320)
-    parser.add_argument("--max_new_tokens", type=int, default=256, help="Max generated CoT / Code tokens per rollout")
+    parser.add_argument("--max_new_tokens", type=int, default=256, help="Max generated <think> CoT / Code tokens per rollout")
     parser.add_argument("--rollout_temp", type=float, default=0.75, help="Sampling temperature for group rollouts")
     parser.add_argument("--rollout_top_p", type=float, default=0.92)
-    parser.add_argument("--lrad_lr", type=float, default=2.5e-5, help="Effective Peak GRPO LR for CS-LRAD recurrent layers")
-    parser.add_argument("--backbone_lr", type=float, default=6.0e-6, help="Effective Peak GRPO LR for Backbone MLPs & Full-Attn")
+    parser.add_argument("--lrad_lr", type=float, default=2.0e-5, help="Peak GRPO LR for CS-LRAD recurrent layers")
+    parser.add_argument("--backbone_lr", type=float, default=5.0e-6, help="Peak GRPO LR for Backbone MLPs & Full-Attn")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps across prompt groups")
-    parser.add_argument("--max_steps", type=int, default=300, help="300 Gold-Injected Dr. GRPO + Top-64 Skew-KD steps")
+    parser.add_argument("--max_steps", type=int, default=300, help="300 <think>-Guided Dr. GRPO + Top-64 Skew-KD steps")
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
-    # Gold-Injected Dr. GRPO + Positive-Only Skew-KD + NLL Anchor Weights
+    # Dr. GRPO + Winner Skew-KD + Winner NLL Anchor Weights
     parser.add_argument("--clip_eps", type=float, default=0.20, help="PPO/GRPO clipping epsilon")
-    parser.add_argument("--beta_ref_kl", type=float, default=0.03, help="Schulman K3 Reference KL penalty weight")
-    parser.add_argument("--grpo_weight", type=float, default=0.45, help="Weight on contrastive Dr. GRPO policy gradient loss")
-    parser.add_argument("--opd_skew_weight", type=float, default=0.35, help="Weight on Verified-Winner Top-64 Skew-KL + Skew-RKL")
+    parser.add_argument("--beta_ref_kl", type=float, default=0.04, help="Schulman K3 Reference KL penalty weight")
+    parser.add_argument("--grpo_weight", type=float, default=0.40, help="Weight on true on-policy contrastive Dr. GRPO loss")
+    parser.add_argument("--opd_skew_weight", type=float, default=0.40, help="Weight on Verified-Winner Top-64 Skew-KL + Skew-RKL")
     parser.add_argument("--gold_cot_weight", type=float, default=0.20, help="Weight on Verified-Winner token NLL anchor")
     parser.add_argument("--topk_logits", type=int, default=64)
     parser.add_argument("--skew_alpha", type=float, default=0.1)
@@ -76,6 +76,7 @@ def parse_args():
     parser.add_argument("--eval_steps", type=int, default=50)
     parser.add_argument("--eval_prompts", type=int, default=60, help="60 held-out validation problems (30 GSM8K + 30 MBPP)")
     parser.add_argument("--save_steps", type=int, default=50)
+    parser.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"])
     parser.add_argument("--no_grad_checkpointing", action="store_true")
     parser.add_argument("--no_compile", action="store_true", help="Disable torch.compile if set")
     parser.add_argument("--seed", type=int, default=777)
@@ -83,22 +84,24 @@ def parse_args():
 
 
 # ==============================================================================
-# 1. Strict Verifiable Reward (RLVR) Engines for Math (GSM8K) & Code (MBPP)
+# 1. Native <think> Reasoning Prompts & Strict Verifiable Reward (RLVR) Engines
 # ==============================================================================
 NUM_REGEX = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
 
-GSM8K_2SHOT_PREFIX = (
+GSM8K_THINK_2SHOT_PREFIX = (
     "Question: Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. "
     "How many clips did Natalia sell altogether in April and May?\n"
-    "Answer: Let's think step by step.\n"
+    "Answer: <think>\n"
     "Natalia sold 48/2 = 24 clips in May.\n"
     "Natalia sold 48+24 = 72 clips altogether in April and May.\n"
+    "</think>\n"
     "#### 72\n\n"
     "Question: Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. "
     "How much did she earn?\n"
-    "Answer: Let's think step by step.\n"
+    "Answer: <think>\n"
     "Weng earns 12/60 = $0.2 per minute.\n"
     "Working 50 minutes, she earned 0.2 x 50 = $10.\n"
+    "</think>\n"
     "#### 10\n\n"
 )
 
@@ -126,7 +129,7 @@ def truncate_at_stop_sequences(text: str, task_type: str) -> str:
     else:
         if "```" in text:
             text = text.split("```", 1)[0] + "\n```"
-    return text.strip()
+    return text
 
 
 def extract_math_number(text: str):
@@ -136,6 +139,11 @@ def extract_math_number(text: str):
         matches = NUM_REGEX.findall(after_hash)
         if matches:
             return matches[0].replace(",", "")
+    if "</think>" in text:
+        after_think = text.split("</think>")[-1].strip()
+        matches = NUM_REGEX.findall(after_think)
+        if matches:
+            return matches[-1].replace(",", "")
     boxed = re.findall(r"\\boxed\{([^}]+)\}", text)
     if boxed:
         matches = NUM_REGEX.findall(boxed[-1])
@@ -164,14 +172,18 @@ def verify_math_reward(generated_text: str, gold_target: str) -> tuple[float, bo
 
     if is_correct:
         reward = 1.0
-        if "####" in clean_text and len(clean_text.split("####")[0].strip()) >= 20:
-            reward += 0.20
+        if "</think>" in clean_text and "####" in clean_text:
+            reward += 0.25
+        elif "####" in clean_text:
+            reward += 0.15
         return reward, True
     else:
         return 0.0, False
 
 
 def extract_python_code(text: str, func_sig_hint: str = "") -> str:
+    if "</think>" in text:
+        text = text.split("</think>", 1)[-1]
     if "```python" in text:
         code = text.split("```python", 1)[1].split("```")[0].strip()
     elif "```" in text:
@@ -218,7 +230,7 @@ def verify_code_reward(generated_text: str, test_list: list[str], func_sig_hint:
         if "PASSED_COUNT:" in out:
             passed = int(out.split("PASSED_COUNT:")[-1].strip().splitlines()[0])
             pass_ratio = passed / max(len(test_list), 1)
-            reward += 1.10 * pass_ratio
+            reward += 1.15 * pass_ratio
             return reward, (passed == len(test_list))
     except Exception:
         pass
@@ -227,7 +239,7 @@ def verify_code_reward(generated_text: str, test_list: list[str], func_sig_hint:
 
 
 # ==============================================================================
-# 2. Math (GSM8K) + Code (MBPP) Dataset Builder (Aligned with Benchmark Format!)
+# 2. Math (GSM8K with <think>) + Code (MBPP) Dataset Builder
 # ==============================================================================
 class MathCodeGRPODataset(TorchDataset):
     def __init__(self, items):
@@ -250,12 +262,15 @@ def build_math_code_grpo_splits(seed=777, val_prompts=60):
         ans_full = row.get("answer", "").strip()
         if q and "####" in ans_full:
             clean_cot = re.sub(r"<<[^>]+>>", "", ans_full).strip()
-            gold_num = clean_cot.split("####")[-1].strip().replace(",", "")
-            prompt_str = f"{GSM8K_2SHOT_PREFIX}Question: {q}\nAnswer: Let's think step by step.\n"
+            cot_steps, final_ans_part = clean_cot.split("####", 1)
+            gold_num = final_ans_part.strip().replace(",", "")
+            # Format prompt with `<think>\n` and gold completion with `</think>\n#### <num>`
+            prompt_str = f"{GSM8K_THINK_2SHOT_PREFIX}Question: {q}\nAnswer: <think>\n"
+            gold_comp = f"{cot_steps.strip()}\n</think>\n#### {gold_num}"
             math_items.append({
                 "task_type": "math",
                 "prompt": prompt_str,
-                "gold_completion": clean_cot,
+                "gold_completion": gold_comp,
                 "gold_target": gold_num,
                 "test_list": [],
                 "func_sig": "",
@@ -307,7 +322,7 @@ def build_math_code_grpo_splits(seed=777, val_prompts=60):
 
 
 # ==============================================================================
-# 3. Unified Single-Pass Gold-Injected Dr. GRPO + Winner-Only Top-64 Skew-KD
+# 3. True On-Policy Contrastive Dr. GRPO + Teacher Top-64 Skew-KD
 # ==============================================================================
 def _fast_token_logprobs_and_topk(logits: torch.Tensor, target_ids: torch.Tensor, topk: int = 0):
     lse = torch.logsumexp(logits, dim=-1)
@@ -320,7 +335,7 @@ def _fast_token_logprobs_and_topk(logits: torch.Tensor, target_ids: torch.Tensor
     return tok_lp, None, None
 
 
-def chunked_gold_injected_grpo_and_skew_kd(
+def chunked_grpo_and_skew_kd(
     h_pol,
     h_ref,
     h_teach,
@@ -333,17 +348,16 @@ def chunked_gold_injected_grpo_and_skew_kd(
     teach_lm_head,
     topk=64,
     skew_alpha=0.1,
-    beta_ref_kl=0.03,
+    beta_ref_kl=0.04,
     chunk_size=64,
 ):
     """
-    Unified Single-Pass Contrastive Dr. GRPO + Winner-Only Top-64 Skew-KD + Winner NLL:
-      - `advantages`: Zero-mean group advantages across the G trajectories (where at least 1 trajectory
-        in the group is ALWAYS a verified `+1.20` winner—either on-policy or Gold-injected!).
-      - `winner_mask`: `1.0` strictly on verified correct trajectories (`is_correct == True`), `0.0` on failed ones.
-      - On `winner_mask == 1.0` trajectories: applies Top-64 Skew-KL + Skew-RKL against the Larger Teacher + NLL.
-      - On `advantages < 0.0` failed on-policy trajectories: applies negative Dr. GRPO gradient (with lower-bound
-        log-ratio clamp `-1.5` so negative updates push down errors without destabilizing representation!).
+    1. Pure On-Policy Contrastive Dr. GRPO (`advantages`):
+       - Non-zero ONLY when the Student generated BOTH a verified correct rollout and a failed rollout in the group!
+       - Never pushes down Student on-policy tokens against an off-policy human string!
+    2. Teacher Top-64 Skew-KD (`opd_loss`) + Winner NLL (`win_nll_loss`):
+       - Applied on verified winning trajectories (`winner_mask == 1.0`), teaching the Student the 2B/4B Teacher's
+         exact `<think>` step-by-step distribution without collapsing its language manifold.
     """
     p_dtype = pol_lm_head.weight.dtype
     r_dtype = ref_lm_head.weight.dtype
@@ -376,18 +390,18 @@ def chunked_gold_injected_grpo_and_skew_kd(
         logits_p_k = logits_p.gather(-1, top_idx_t)
         del logits_p
 
-        # 1. Contrastive Dr. GRPO Surrogate:
-        # Gate negative updates when log(pi_pol / pi_ref) < -1.5 so we never push down already-unlikely tokens!
         log_ratio_ref = (tok_logp_p - tok_logp_r).clamp(min=-10.0, max=10.0)
-        neg_gate = torch.where((adv_col < 0.0) & (log_ratio_ref.detach() < -1.5), torch.zeros_like(adv_col), torch.ones_like(adv_col))
+        neg_gate = torch.where(
+            (adv_col < 0.0) & (log_ratio_ref.detach() < -1.0),
+            torch.zeros_like(adv_col),
+            torch.ones_like(adv_col),
+        )
         ratio = torch.exp(tok_logp_p - tok_logp_p.detach())
         pg_tok = (-ratio * adv_col * neg_gate) * m_c
 
-        # 2. Schulman K3 Reference KL penalty
         log_diff_ref = (-log_ratio_ref).clamp(min=-10.0, max=10.0)
         k3_ref_kl = (torch.exp(log_diff_ref) - log_diff_ref - 1.0) * m_c
 
-        # 3. Winner-Only Top-64 Skew-KL + Skew-Reverse-KL against Larger Teacher
         probs_p_k = F.softmax(logits_p_k, dim=-1).clamp(min=1e-8)
         mixed_q = (skew_alpha * probs_t_k + (1.0 - skew_alpha) * probs_p_k).clamp(min=1e-8)
         skl_tok = (probs_t_k * (probs_t_k.log() - mixed_q.log())).sum(dim=-1)
@@ -477,7 +491,9 @@ def evaluate_math_code_greedy(accelerator, wrapper, tokenizer, val_dataset, args
             eos_token_id=eos_id,
         )
         gen_tokens = gen_out[0, p_len:].tolist()
-        gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+        if eos_id in gen_tokens:
+            gen_tokens = gen_tokens[: gen_tokens.index(eos_id)]
+        gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=False)
 
         if item["task_type"] == "math":
             rew, is_corr = verify_math_reward(gen_text, item["gold_target"])
@@ -499,10 +515,32 @@ def evaluate_math_code_greedy(accelerator, wrapper, tokenizer, val_dataset, args
     return math_acc, code_acc, mean_rew
 
 
+def save_student_checkpoint_clean(unwrapped_student, tokenizer, save_dir: str):
+    """
+    Saves the student checkpoint while ensuring `gradient_checkpointing` is persisted
+    as `False` in `config.json` so downstream evaluation scripts do not inherit an
+    active gradient checkpointing flag.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    orig_gc = getattr(unwrapped_student.config, "gradient_checkpointing", False)
+    unwrapped_student.config.gradient_checkpointing = False
+    unwrapped_student.config.save_pretrained(save_dir)
+    unwrapped_student.config.gradient_checkpointing = orig_gc
+    tokenizer.save_pretrained(save_dir)
+    torch.save(unwrapped_student.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed + int(os.environ.get("LOCAL_RANK", 0)))
     use_gc = not args.no_grad_checkpointing
+    # CRITICAL FIX: Never combine torch.compile inside LRADDecoderBlock with gradient_checkpointing_enable(),
+    # and explicitly disable any inherited gradient_checkpointing flag from config.json when use_gc=False!
+    use_compile = (not args.no_compile) and (not use_gc)
+
+    if hasattr(torch._C, "_dynamo") and hasattr(torch._C._dynamo.eval_frame, "_set_lru_cache"):
+        torch._C._dynamo.eval_frame._set_lru_cache(False)
+
     accelerator = Accelerator(mixed_precision="bf16", gradient_accumulation_steps=args.grad_accum_steps)
 
     ckpt_to_load = args.input_ckpt_dir
@@ -513,7 +551,7 @@ def main():
     eos_id = tokenizer.eos_token_id
 
     if accelerator.is_main_process:
-        print("[Stage 4C GRPO Builder] Loading 2-Shot GSM8K (Math CoT) & 1-Shot MBPP (Python Code) train/val splits...")
+        print("[Stage 4C GRPO Builder] Loading <think> 2-Shot GSM8K (Math CoT) & 1-Shot MBPP (Python Code) splits...")
     train_ds, val_ds, n_math, n_code = build_math_code_grpo_splits(seed=args.seed, val_prompts=args.eval_prompts)
     accelerator.wait_for_everyone()
 
@@ -538,6 +576,13 @@ def main():
 
     if getattr(student.config, "tie_word_embeddings", True):
         student.lm_head.weight = student.model.token_embedding.weight
+
+    # Explicitly disable gradient checkpointing on student BEFORE copying ref_student so ref_student is always clean
+    if hasattr(student, "gradient_checkpointing_disable"):
+        student.gradient_checkpointing_disable()
+    student.config.gradient_checkpointing = False
+    if hasattr(student, "model"):
+        student.model.gradient_checkpointing = False
 
     ref_student = copy.deepcopy(student)
     ref_student.eval()
@@ -594,13 +639,14 @@ def main():
 
     if accelerator.is_main_process:
         print("=" * 94)
-        print("STAGE 4C: GOLD-INJECTED CONTRASTIVE DR. GRPO + TOP-64 SKEW-KD (MATH CoT & PYTHON CODE)")
+        print("STAGE 4C: <think>-GUIDED DR. GRPO + TOP-64 SKEW-KD (MATH CoT & PYTHON CODE)")
         print(f"  - Starting Checkpoint  : {ckpt_to_load}")
-        print(f"  - Larger Teacher       : {args.teacher_id} (Winner-Only Top-{args.topk_logits} Skew-KD + Contrastive GRPO)")
-        print(f"  - Verifiable Tasks     : {n_math:,} GSM8K (2-Shot CoT) + {n_code:,} MBPP (1-Shot Python Unit-Tests)")
-        print(f"  - Group Rollout Size   : G={args.group_size} rollouts/prompt (Gold-Injected when all G fail -> 100% active steps!)")
+        print(f"  - Larger Teacher       : {args.teacher_id} (Winner Top-{args.topk_logits} Skew-KD + Pure On-Policy GRPO)")
+        print(f"  - Verifiable Tasks     : {n_math:,} GSM8K (<think> 2-Shot CoT) + {n_code:,} MBPP (1-Shot Python)")
+        print(f"  - Group Rollout Size   : G={args.group_size} rollouts/prompt (Exact BPE Token Preservation!)")
+        print(f"  - Gradient Checkpoint  : {'ENABLED' if use_gc else 'DISABLED'}")
         print(f"  - Peak Learning Rates  : LRAD={args.lrad_lr:.2e} | Backbone={args.backbone_lr:.2e}")
-        print(f"  - Loss Formulation     : {args.grpo_weight}*Dr.GRPO + {args.opd_skew_weight}*Winner_SkewKD + {args.gold_cot_weight}*Winner_NLL")
+        print(f"  - Loss Formulation     : {args.grpo_weight}*OnPol_GRPO + {args.opd_skew_weight}*Winner_SkewKD + {args.gold_cot_weight}*Winner_NLL")
         print("=" * 94)
 
     accelerator.wait_for_everyone()
@@ -646,7 +692,7 @@ def main():
                 )
             unwrapped_student.train()
 
-            # 2. Score all G on-policy rollouts
+            # 2. Score all G on-policy rollouts while preserving EXACT generated token IDs (No BPE re-tokenization shift!)
             cleaned_seqs = []
             end_lengths = []
             rewards = []
@@ -656,7 +702,8 @@ def main():
                 comp_ids = gen_seqs[i, p_len:].tolist()
                 if eos_id in comp_ids:
                     comp_ids = comp_ids[: comp_ids.index(eos_id)]
-                raw_txt = tokenizer.decode(comp_ids, skip_special_tokens=True)
+                # Decode with skip_special_tokens=False so `<think>` and `</think>` tags are preserved!
+                raw_txt = tokenizer.decode(comp_ids, skip_special_tokens=False)
                 clean_txt = truncate_at_stop_sequences(raw_txt, item["task_type"])
 
                 if item["task_type"] == "math":
@@ -666,28 +713,46 @@ def main():
                 rewards.append(r_val)
                 correct_flags.append(float(is_c))
 
-                clean_comp_ids = tokenizer(
-                    clean_txt, add_special_tokens=False, truncation=True, max_length=args.max_new_tokens - 1
-                )["input_ids"] + [eos_id]
-                cleaned_seqs.append(p_ids + clean_comp_ids)
-                end_lengths.append(len(clean_comp_ids))
+                # If stop sequence truncated the text, re-tokenize the full prompt + clean_txt together to preserve exact BPE boundary!
+                if len(clean_txt) < len(raw_txt):
+                    full_ids = tokenizer(
+                        item["prompt"] + clean_txt, add_special_tokens=False, truncation=True, max_length=p_len + args.max_new_tokens - 1
+                    )["input_ids"] + [eos_id]
+                else:
+                    full_ids = p_ids + comp_ids[: args.max_new_tokens - 1] + [eos_id]
+
+                cleaned_seqs.append(full_ids)
+                end_lengths.append(max(1, len(full_ids) - p_len))
 
             onpolicy_any_correct = float(any(correct_flags))
             onpolicy_mean_rew = sum(rewards) / max(len(rewards), 1)
 
-            # 3. GOLD-INJECTED GROUP GUARANTEE:
-            # If none of the G on-policy rollouts solved the problem (or Even if they did, to anchor against drift),
-            # replace the lowest-reward rollout slot with the verified Gold CoT / Python solution (`reward = 1.20`)!
-            # This guarantees 100% of groups have a verified `+1.20` winner AND active contrastive Dr. GRPO advantages!
-            if not any(correct_flags):
-                gold_comp_ids = tokenizer(
-                    item["gold_completion"], add_special_tokens=False, truncation=True, max_length=args.max_new_tokens - 1
+            # 3. SEPARATE ON-POLICY CONTRASTIVE GRPO FROM OFF-POLICY GOLD TEACHER ANCHOR:
+            # - Case A (`onpolicy_any_correct == True`): The Student solved it on-policy!
+            #   Compute standardized on-policy group advantages across the G student rollouts, AND also inject
+            #   the Gold `<think>` trajectory into the worst failed slot ONLY for Winner Skew-KD (with advantage=0 on Gold!).
+            # - Case B (`onpolicy_any_correct == False`): All G rollouts failed.
+            #   Set `advantages = 0` on all rollouts (so we NEVER blindly push down the student's language manifold
+            #   against an off-policy string!), and inject the Gold `<think>` trajectory into slot 0 for Teacher Top-64 Skew-KD!
+            rew_t = torch.tensor(rewards, dtype=torch.float32, device=accelerator.device)
+            if onpolicy_any_correct and (rew_t.std() > 1e-4):
+                advantages = (rew_t - rew_t.mean()) / (rew_t.std() + 1e-4)
+            else:
+                advantages = torch.zeros_like(rew_t)
+
+            if not onpolicy_any_correct:
+                # Tokenize prompt + gold_completion TOGETHER as one string so the `\n` BPE boundary is 100% exact!
+                gold_full_ids = tokenizer(
+                    item["prompt"] + item["gold_completion"],
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=p_len + args.max_new_tokens - 1,
                 )["input_ids"] + [eos_id]
-                replace_idx = int(torch.tensor(rewards).argmin().item())
-                cleaned_seqs[replace_idx] = p_ids + gold_comp_ids
-                end_lengths[replace_idx] = len(gold_comp_ids)
-                rewards[replace_idx] = 1.20
+                replace_idx = int(rew_t.argmin().item())
+                cleaned_seqs[replace_idx] = gold_full_ids
+                end_lengths[replace_idx] = max(1, len(gold_full_ids) - p_len)
                 correct_flags[replace_idx] = 1.0
+                advantages[replace_idx] = 0.0
 
             max_seq_l = max(len(s) for s in cleaned_seqs)
             target_len = min(640, ((max_seq_l + c_align - 1) // c_align) * c_align)
@@ -703,6 +768,7 @@ def main():
                     resp_mask[i, p_len:valid_end] = 1.0
 
             gen_seqs_aligned = torch.tensor(padded_batch, dtype=torch.long, device=accelerator.device)
+            winner_mask = torch.tensor(correct_flags, dtype=torch.float32, device=accelerator.device)
 
             with accelerator.accumulate(wrapper):
                 with torch.no_grad():
@@ -713,12 +779,8 @@ def main():
                         input_ids=gen_seqs_aligned, attention_mask=None, output_hidden_states=False, use_cache=False
                     ).last_hidden_state
 
-                    rew_t = torch.tensor(rewards, dtype=torch.float32, device=accelerator.device)
-                    winner_mask = torch.tensor(correct_flags, dtype=torch.float32, device=accelerator.device)
-                    advantages = rew_t - rew_t.mean()
-
                 pol_h = wrapper(gen_seqs_aligned)
-                grpo_loss, opd_skew_loss, win_nll_loss, ref_kl = chunked_gold_injected_grpo_and_skew_kd(
+                grpo_loss, opd_skew_loss, win_nll_loss, ref_kl = chunked_grpo_and_skew_kd(
                     pol_h, ref_h, t_h, gen_seqs_aligned, resp_mask, advantages, winner_mask,
                     unwrapped_student.lm_head, ref_student.lm_head, teacher.lm_head,
                     topk=args.topk_logits, skew_alpha=args.skew_alpha, beta_ref_kl=args.beta_ref_kl,
@@ -782,11 +844,8 @@ def main():
                         if val_score >= best_val_score:
                             best_val_score = val_score
                             best_dir = os.path.join(args.output_dir, "best")
-                            os.makedirs(best_dir, exist_ok=True)
                             unwrapped = accelerator.unwrap_model(wrapper).student
-                            unwrapped.config.save_pretrained(best_dir)
-                            tokenizer.save_pretrained(best_dir)
-                            torch.save(unwrapped.state_dict(), os.path.join(best_dir, "pytorch_model.bin"))
+                            save_student_checkpoint_clean(unwrapped, tokenizer, best_dir)
                             print(f"  >>> New Best Stage 4C Combined Greedy Accuracy ({best_val_score*100:.1f}%)! Saved to {best_dir}")
                     accelerator.wait_for_everyone()
                     t0 = time.time()
@@ -794,11 +853,8 @@ def main():
                 if step % args.save_steps == 0 or step >= args.max_steps:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
-                        os.makedirs(args.output_dir, exist_ok=True)
                         unwrapped = accelerator.unwrap_model(wrapper).student
-                        unwrapped.config.save_pretrained(args.output_dir)
-                        tokenizer.save_pretrained(args.output_dir)
-                        torch.save(unwrapped.state_dict(), os.path.join(args.output_dir, "pytorch_model.bin"))
+                        save_student_checkpoint_clean(unwrapped, tokenizer, args.output_dir)
                     accelerator.wait_for_everyone()
                     t0 = time.time()
 

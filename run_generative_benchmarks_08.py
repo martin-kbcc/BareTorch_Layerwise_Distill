@@ -142,13 +142,13 @@ def load_gsm8k_test(max_samples=-1):
     fewshot_prefix = (
         "Question: Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. "
         "How many clips did Natalia sell altogether in April and May?\n"
-        "Answer: Let's think step by step.\n"
+        "Answer: <think>\n"
         "Natalia sold 48/2 = 24 clips in May.\n"
         "Natalia sold 48+24 = 72 clips altogether in April and May.\n"
         "#### 72\n\n"
         "Question: Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. "
         "How much did she earn?\n"
-        "Answer: Let's think step by step.\n"
+        "Answer: <think>\n"
         "Weng earns 12/60 = $0.2 per minute.\n"
         "Working 50 minutes, she earned 0.2 x 50 = $10.\n"
         "#### 10\n\n"
@@ -161,7 +161,7 @@ def load_gsm8k_test(max_samples=-1):
         q = row["question"].strip()
         ans = row["answer"].strip()
         gold_num = ans.split("####")[-1].strip().replace(",", "")
-        prompt = f"{fewshot_prefix}Question: {q}\nAnswer: Let's think step by step.\n"
+        prompt = f"{fewshot_prefix}Question: {q}\nAnswer: <think>\n"
         items.append({"prompt": prompt, "gold_target": gold_num})
     return items
 
@@ -231,7 +231,7 @@ def evaluate_model_on_generative_suite(model, tokenizer, gsm_items, mbpp_items, 
         )
         for i, item in enumerate(batch):
             gen_toks = gen_out[i, max_p:].tolist()
-            gen_txt = tokenizer.decode(gen_toks, skip_special_tokens=True)
+            gen_txt = tokenizer.decode(gen_toks, skip_special_tokens=False)
             if check_gsm8k_correct(gen_txt, item["gold_target"]):
                 gsm_correct += 1
 
@@ -265,7 +265,7 @@ def evaluate_model_on_generative_suite(model, tokenizer, gsm_items, mbpp_items, 
         )
         for i, item in enumerate(batch):
             gen_toks = gen_out[i, max_p:].tolist()
-            gen_txt = tokenizer.decode(gen_toks, skip_special_tokens=True)
+            gen_txt = tokenizer.decode(gen_toks, skip_special_tokens=False)
             mbpp_eval_tuples.append((gen_txt, item["test_list"], item["func_sig"]))
 
         if accelerator.is_main_process and ((start // args.batch_size) % 2 == 0):

@@ -263,6 +263,21 @@ def evaluate_stage3b(accelerator, wrapper, teacher, t_backbone, val_loader, args
     return means[0], means[1], means[2], means[3], means[4]
 
 
+def save_student_checkpoint_clean(unwrapped_student, tokenizer, save_dir: str):
+    """
+    Saves the student checkpoint while ensuring `gradient_checkpointing` is persisted
+    as `False` in `config.json` so downstream stages (4A, 4B, 4C) do not inherit an
+    active gradient checkpointing flag when running with `--no_grad_checkpointing` + `torch.compile`.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    orig_gc = getattr(unwrapped_student.config, "gradient_checkpointing", False)
+    unwrapped_student.config.gradient_checkpointing = False
+    unwrapped_student.config.save_pretrained(save_dir)
+    unwrapped_student.config.gradient_checkpointing = orig_gc
+    tokenizer.save_pretrained(save_dir)
+    torch.save(unwrapped_student.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -271,6 +286,9 @@ def main():
     # because torch.utils.checkpoint (use_reentrant=False) saved-tensor metadata validation conflicts with
     # TorchDynamo graph caching during backward recomputation!
     use_compile = (not args.no_compile) and (not use_gc)
+
+    if hasattr(torch._C, "_dynamo") and hasattr(torch._C._dynamo.eval_frame, "_set_lru_cache"):
+        torch._C._dynamo.eval_frame._set_lru_cache(False)
 
     accelerator = Accelerator(mixed_precision="bf16", gradient_accumulation_steps=args.grad_accum_steps)
 
@@ -297,6 +315,12 @@ def main():
 
     if use_gc:
         student.gradient_checkpointing_enable()
+    else:
+        if hasattr(student, "gradient_checkpointing_disable"):
+            student.gradient_checkpointing_disable()
+        student.config.gradient_checkpointing = False
+        if hasattr(student, "model"):
+            student.model.gradient_checkpointing = False
 
     if use_compile:
         for layer in student.model.layers:
@@ -449,11 +473,8 @@ def main():
                         if val_loss < best_val_loss:
                             best_val_loss = val_loss
                             best_dir = os.path.join(args.output_dir, "best")
-                            os.makedirs(best_dir, exist_ok=True)
                             unwrapped = accelerator.unwrap_model(wrapper).student
-                            unwrapped.config.save_pretrained(best_dir)
-                            tokenizer.save_pretrained(best_dir)
-                            torch.save(unwrapped.state_dict(), os.path.join(best_dir, "pytorch_model.bin"))
+                            save_student_checkpoint_clean(unwrapped, tokenizer, best_dir)
                             print(f"  >>> New Best 32K-Context Val Loss ({best_val_loss:.4f})! Saved to {best_dir}")
                     accelerator.wait_for_everyone()
                     t0 = time.time()
@@ -461,11 +482,8 @@ def main():
                 if step % args.save_steps == 0 or step >= args.max_steps:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
-                        os.makedirs(args.output_dir, exist_ok=True)
                         unwrapped = accelerator.unwrap_model(wrapper).student
-                        unwrapped.config.save_pretrained(args.output_dir)
-                        tokenizer.save_pretrained(args.output_dir)
-                        torch.save(unwrapped.state_dict(), os.path.join(args.output_dir, "pytorch_model.bin"))
+                        save_student_checkpoint_clean(unwrapped, tokenizer, args.output_dir)
                         print(f"  --> Saved Latest Stage 3B checkpoint at step {step} to {args.output_dir}")
                     accelerator.wait_for_everyone()
                     t0 = time.time()
