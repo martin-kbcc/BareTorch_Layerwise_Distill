@@ -21,23 +21,23 @@ torch.set_float32_matmul_precision("high")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Stage 3B: Long-Context (8192-Token / 128-Chunk) CS-LRAD Recurrent Horizon Extension KD"
+        description="Stage 3B: Long-Context (32768-Token / 512-Chunk) CS-LRAD Recurrent Horizon Extension KD"
     )
     # Paths
     parser.add_argument("--teacher_id", type=str, default="Qwen/Qwen3.5-2B", help="Native Teacher HF ID")
     parser.add_argument("--stage3_ckpt_dir", type=str, default="./checkpoints/stage3_final_distilled/best", help="Path to Stage 3 best checkpoint")
     parser.add_argument("--data_dir", type=str, default="./data/fineweb_edu_packed_2048", help="Path to existing 2048-packed FineWeb-Edu dataset")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints/stage3b_long_context_8k", help="Directory to save Stage 3B 8K-context checkpoints")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints/stage3b_long_context_32k", help="Directory to save Stage 3B long-context checkpoints")
 
     # Long-Context & Differential LR Hyperparameters
-    parser.add_argument("--target_seq_len", type=int, default=8192, help="Target long-context sequence length (multiple of 2048)")
-    parser.add_argument("--late_token_weight", type=float, default=1.5, help="Focal multiplier on tokens at positions >= 2048 (chunks 32..127)")
-    parser.add_argument("--lrad_lr", type=float, default=6.0e-5, help="Peak LR for CS-LRAD mixers & ln1 during 8K horizon extension")
+    parser.add_argument("--target_seq_len", type=int, default=32768, help="Target long-context sequence length (multiple of 2048)")
+    parser.add_argument("--late_token_weight", type=float, default=1.5, help="Focal multiplier on tokens at positions >= 2048")
+    parser.add_argument("--lrad_lr", type=float, default=6.0e-5, help="Peak LR for CS-LRAD mixers & ln1 during horizon extension")
     parser.add_argument("--backbone_lr", type=float, default=8.0e-6, help="Gentle peak LR for Backbone MLPs & Full-Attn layers")
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--micro_batch_size", type=int, default=1, help="8192-token sequences per GPU per step")
+    parser.add_argument("--micro_batch_size", type=int, default=1, help="Long-context sequences per GPU per step")
     parser.add_argument("--grad_accum_steps", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=1000, help="1000 steps @ 65.5k tok/step = ~65.5M long-context tokens")
+    parser.add_argument("--max_steps", type=int, default=500, help="500 steps @ 262.1k tok/step = ~131.1M long-context tokens")
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
@@ -45,29 +45,29 @@ def parse_args():
     parser.add_argument("--kl_weight", type=float, default=0.5)
     parser.add_argument("--ce_weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--logit_chunk_size", type=int, default=256, help="Chunk size along 8192 sequence to keep 248K vocab logits small")
+    parser.add_argument("--logit_chunk_size", type=int, default=256, help="Chunk size along sequence to keep 248K vocab logits small")
 
     # Logging, Evaluation & Saving
-    parser.add_argument("--log_steps", type=int, default=20)
-    parser.add_argument("--eval_steps", type=int, default=200)
+    parser.add_argument("--log_steps", type=int, default=10)
+    parser.add_argument("--eval_steps", type=int, default=100)
     parser.add_argument("--eval_batches", type=int, default=-1, help="-1 = evaluate entire validation split")
-    parser.add_argument("--save_steps", type=int, default=250)
+    parser.add_argument("--save_steps", type=int, default=100)
 
     # Hardware & Compilation
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"])
     parser.add_argument("--no_compile", action="store_true")
-    parser.add_argument("--no_grad_checkpointing", action="store_true", help="Keep grad checkpointing enabled by default for 8192 seq_len")
+    parser.add_argument("--no_grad_checkpointing", action="store_true", help="Keep grad checkpointing enabled by default for 32K seq_len")
     parser.add_argument("--seed", type=int, default=45)
     return parser.parse_args()
 
 
 class LongContextConcatenatedDataset(TorchDataset):
     """
-    Zero-copy wrapper that concatenates `concat_factor` (e.g., 4x 2048 = 8192 tokens)
+    Zero-copy wrapper that concatenates `concat_factor` (e.g., 16x 2048 = 32768 tokens)
     blocks from the existing `fineweb_edu_packed_2048` Arrow dataset on the fly.
     """
-    def __init__(self, base_dataset, target_seq_len: int = 8192):
+    def __init__(self, base_dataset, target_seq_len: int = 32768):
         self.base_ds = base_dataset
         self.base_seq_len = len(base_dataset[0]["input_ids"])
         self.concat_factor = max(1, target_seq_len // self.base_seq_len)
@@ -103,13 +103,6 @@ def chunked_long_context_kl_and_ce_loss(
     ce_weight: float = 0.5,
     chunk_size: int = 256,
 ):
-    """
-    Computes Long-Context Logit KL + CE across 8192 tokens while:
-      1. Applying `late_token_weight` (1.5x) to tokens at position >= 2048 (forcing CS-LRAD decay gates
-         to prioritize long-horizon recurrent retrieval across chunks 32..127).
-      2. Reporting separate Early-Context (0..2048) vs. Late-Context (2048..8192) Student/Teacher CE
-         so we can verify zero perplexity degradation at 8K context!
-    """
     s_dtype = student_lm_head.weight.dtype
     t_dtype = teacher_lm_head.weight.dtype
 
@@ -273,8 +266,11 @@ def evaluate_stage3b(accelerator, wrapper, teacher, t_backbone, val_loader, args
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
-    use_compile = not args.no_compile
     use_gc = not args.no_grad_checkpointing
+    # CRITICAL FIX: Never combine torch.compile inside LRADDecoderBlock with gradient_checkpointing_enable(),
+    # because torch.utils.checkpoint (use_reentrant=False) saved-tensor metadata validation conflicts with
+    # TorchDynamo graph caching during backward recomputation!
+    use_compile = (not args.no_compile) and (not use_gc)
 
     accelerator = Accelerator(mixed_precision="bf16", gradient_accumulation_steps=args.grad_accum_steps)
 
@@ -336,7 +332,7 @@ def main():
         print(f"  - Long-Context Dataset : {len(train_ds):,} train seqs ({seq_len} tok) | {len(val_ds):,} val seqs")
         print(f"  - Late-Horizon Weight  : {args.late_token_weight}x on positions [{base_short_len}..{seq_len}]")
         print(f"  - Differential LRs     : CS-LRAD = {args.lrad_lr:.2e} | Backbone = {args.backbone_lr:.2e}")
-        print(f"  - Gradient Checkpoint  : {'ENABLED' if use_gc else 'DISABLED'}")
+        print(f"  - Gradient Checkpoint  : {'ENABLED (Eager Recompute Safe)' if use_gc else 'DISABLED'}")
         print(f"  - Global Batch Size    : {tokens_per_step:,} tokens/step ({args.micro_batch_size} micro * {accelerator.num_processes} GPUs * {args.grad_accum_steps} accum)")
         print(f"  - Total Token Budget   : {tokens_per_step * args.max_steps / 1e6:.2f}M tokens ({args.max_steps} steps)")
         print("=" * 88)
@@ -429,11 +425,11 @@ def main():
                         early_ppl = min(torch.tensor(avg_early_ce).exp().item(), 9999.0)
                         late_ppl = min(torch.tensor(avg_late_ce).exp().item(), 9999.0)
                         t_late_ppl = min(torch.tensor(avg_late_t_ce).exp().item(), 9999.0)
-                        tok_str = "Compiling DONE" if step == 1 else f"{toks_per_sec:,.0f} tok/s"
+                        tok_str = "Step 1 DONE" if step == 1 else f"{toks_per_sec:,.0f} tok/s"
 
                         print(
-                            f"[Stage 3B 8K] Step {step:04d}/{args.max_steps} | Loss: {avg_l:.4f} | KL: {avg_kl:.4f} | "
-                            f"PPL@0-2K: {early_ppl:.2f} | PPL@2K-8K: {late_ppl:.2f} (vs T: {t_late_ppl:.2f}) | "
+                            f"[Stage 3B 32K] Step {step:04d}/{args.max_steps} | Loss: {avg_l:.4f} | KL: {avg_kl:.4f} | "
+                            f"PPL@0-2K: {early_ppl:.2f} | PPL@2K-32K: {late_ppl:.2f} (vs T: {t_late_ppl:.2f}) | "
                             f"LR: {lrs[0]:.2e}/{lrs[1]:.2e} | {tok_str}"
                         )
 
@@ -447,8 +443,8 @@ def main():
                         v_late_ppl = min(torch.tensor(val_late_ce).exp().item(), 9999.0)
                         v_t_ppl = min(torch.tensor(val_late_t_ce).exp().item(), 9999.0)
                         print(
-                            f"  >>> [VAL 8K @ Step {step:04d}] Total: {val_loss:.4f} | KL: {val_kl:.4f} | "
-                            f"Val PPL@0-2K: {v_early_ppl:.2f} | Val PPL@2K-8K: {v_late_ppl:.2f} (Teacher 2K-8K PPL: {v_t_ppl:.2f})"
+                            f"  >>> [VAL 32K @ Step {step:04d}] Total: {val_loss:.4f} | KL: {val_kl:.4f} | "
+                            f"Val PPL@0-2K: {v_early_ppl:.2f} | Val PPL@2K-32K: {v_late_ppl:.2f} (Teacher 2K-32K PPL: {v_t_ppl:.2f})"
                         )
                         if val_loss < best_val_loss:
                             best_val_loss = val_loss
@@ -458,7 +454,7 @@ def main():
                             unwrapped.config.save_pretrained(best_dir)
                             tokenizer.save_pretrained(best_dir)
                             torch.save(unwrapped.state_dict(), os.path.join(best_dir, "pytorch_model.bin"))
-                            print(f"  >>> New Best 8K-Context Val Loss ({best_val_loss:.4f})! Saved to {best_dir}")
+                            print(f"  >>> New Best 32K-Context Val Loss ({best_val_loss:.4f})! Saved to {best_dir}")
                     accelerator.wait_for_everyone()
                     t0 = time.time()
 
