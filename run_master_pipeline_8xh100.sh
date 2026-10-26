@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # ==================================================================================================
 # MASTER END-TO-END BARETORCH HYBRIDIZATION & UP-DISTILLATION ENGINE (8x NVIDIA H100 SXM5)
-# - Stage 0 + 0-Verify                          : Surgical Weight Transfer + 6-Point Verification
-# - Stages 1, 2, 3, 4A (Full-Vocab KD & SFT)    : Teacher = Qwen/Qwen3.5-2B (Native Subspace!)
-# - Stage 4B (DPO + Top-64 Skew-KD)             : Teacher = Qwen/Qwen3.5-4B -> Followed by lm_eval!
-# - Stage 4C (Gold-Injected Dr. GRPO + Skew-KD) : Teacher = Qwen/Qwen3.5-4B -> Followed by GSM8K/MBPP!
+# - Stage 0 + 0-Verify                           : Surgical Weight Transfer + 6-Point Verification
+# - Stages 1, 2, 3 (2K Pretrain KD)              : Teacher = Qwen/Qwen3.5-2B (Native Subspace!)
+# - Stage 3B (32K Long-Context Horizon Extension): Teacher = Qwen/Qwen3.5-2B (512-Chunk Calibration!)
+# - Stage 4A (5-Pillar Focal SFT & KD)           : Teacher = Qwen/Qwen3.5-2B (Native Subspace!)
+# - Stage 4B (DPO + Top-64 Skew-KD)              : Teacher = Qwen/Qwen3.5-4B -> Followed by lm_eval!
+# - Stage 4C (Gold-Injected Dr. GRPO + Skew-KD)  : Teacher = Qwen/Qwen3.5-4B -> Followed by GSM8K/MBPP!
 # ==================================================================================================
 set -euo pipefail
 
@@ -45,6 +47,7 @@ CKPT_STAGE0="${CKPT_ROOT}/stage0_initialized"
 CKPT_STAGE1="${CKPT_ROOT}/stage1_mixer_aligned"
 CKPT_STAGE2="${CKPT_ROOT}/stage2_end2end_aligned"
 CKPT_STAGE3="${CKPT_ROOT}/stage3_final_distilled"
+CKPT_STAGE3B="${CKPT_ROOT}/stage3b_long_context_32k"
 CKPT_STAGE4A="${CKPT_ROOT}/stage4a_5pillar_8k_2B"
 CKPT_STAGE4B="${CKPT_ROOT}/stage4b_6pillar_dpo_4B"
 CKPT_STAGE4C="${CKPT_ROOT}/stage4c_grpo_math_code_4B"
@@ -71,7 +74,7 @@ PIPELINE_START=$(date +%s)
 # STAGE 0: Surgical Hybrid Initialization (init_student_00.py) + 6-Point Verification (verify_init.py)
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE0}/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 0/7] Initializing BareTorch Hybrid Student from ${BASE_MODEL}..."
+    echo -e "\n>>> [STAGE 0/8] Initializing BareTorch Hybrid Student from ${BASE_MODEL}..."
     T0=$(date +%s)
     python init_student_00.py \
         --teacher_id "${BASE_MODEL}" \
@@ -101,7 +104,7 @@ fi
 # STAGE 0B: Parallel Pretraining Dataset Preparation (prepare_dataset_00b.py)
 # --------------------------------------------------------------------------------------------------
 if [ ! -d "${PRETRAIN_DATA_DIR}/train" ]; then
-    echo -e "\n>>> [STAGE 0B/7] Streaming, Tokenizing & Packing 600M FineWeb-Edu Tokens (48 CPU workers)..."
+    echo -e "\n>>> [STAGE 0B/8] Streaming, Tokenizing & Packing 600M FineWeb-Edu Tokens (48 CPU workers)..."
     T0=$(date +%s)
     python prepare_dataset_00b.py \
         --tokenizer_path "${CKPT_STAGE0}" \
@@ -122,7 +125,7 @@ fi
 # 8 GPUs * 8 micro_batch * 1 accum * 2048 = 131,072 tokens/step * 1,000 steps = 131.1M tokens
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE1}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 1/7] Running Parallel Teacher-Forced CS-LRAD Mixer Alignment (131k tok/step)..."
+    echo -e "\n>>> [STAGE 1/8] Running Parallel Teacher-Forced CS-LRAD Mixer Alignment (131k tok/step)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage1_mixer_align_01.py \
         --teacher_id "${BASE_MODEL}" \
@@ -148,7 +151,7 @@ fi
 # 8 GPUs * 4 micro_batch * 1 accum * 2048 = 65,536 tokens/step * 2,500 steps = 163.8M tokens
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE2}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 2/7] Running End-to-End Hidden-State & Logit KD (65.5k tok/step, grad_accum=1)..."
+    echo -e "\n>>> [STAGE 2/8] Running End-to-End Hidden-State & Logit KD (65.5k tok/step, grad_accum=1)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage2_end2end_02.py \
         --teacher_id "${BASE_MODEL}" \
@@ -175,7 +178,7 @@ fi
 # 8 GPUs * 4 micro_batch * 1 accum * 2048 = 65,536 tokens/step * 3,500 steps = 229.4M tokens
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE3}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 3/7] Running Full-Model Joint KD with Differential LRs (65.5k tok/step, grad_accum=1)..."
+    echo -e "\n>>> [STAGE 3/8] Running Full-Model Joint KD with Differential LRs (65.5k tok/step, grad_accum=1)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage3_full_kd_03.py \
         --teacher_id "${BASE_MODEL}" \
@@ -200,17 +203,47 @@ else
 fi
 
 # --------------------------------------------------------------------------------------------------
+# STAGE 3B: Long-Context (32768-Token / 512-Chunk) Horizon Extension (train_stage3b_long_context_03b.py)
+# 8 GPUs * 1 micro_batch * 1 accum * 32768 = 262,144 tokens/step * 500 steps = 131.1M long-context tokens
+# --------------------------------------------------------------------------------------------------
+if [ ! -f "${CKPT_STAGE3B}/best/pytorch_model.bin" ]; then
+    echo -e "\n>>> [STAGE 3B/8] Running 32768-Token (512-Chunk) Long-Context Horizon Extension..."
+    T0=$(date +%s)
+    ${ACCEL_CMD} train_stage3b_long_context_03b.py \
+        --teacher_id "${BASE_MODEL}" \
+        --stage3_ckpt_dir "${CKPT_STAGE3}/best" \
+        --data_dir "${PRETRAIN_DATA_DIR}" \
+        --output_dir "${CKPT_STAGE3B}" \
+        --target_seq_len 32768 \
+        --late_token_weight 1.5 \
+        --lrad_lr 6.0e-5 \
+        --backbone_lr 8.0e-6 \
+        --micro_batch_size 1 \
+        --grad_accum_steps 1 \
+        --max_steps 500 \
+        --logit_chunk_size 256 \
+        --log_steps 10 \
+        --eval_steps 100 \
+        --save_steps 100 \
+        --num_workers 8 \
+        2>&1 | tee "${LOG_DIR}/03b_stage3b_long_context_32k.log"
+    echo ">>> [STAGE 3B DONE] Completed in $(($(date +%s) - T0))s."
+else
+    echo ">>> [STAGE 3B SKIP] Found existing ${CKPT_STAGE3B}/best/pytorch_model.bin"
+fi
+
+# --------------------------------------------------------------------------------------------------
 # STAGE 4A: 5-Pillar Focal SFT with NATIVE BASE_MODEL Teacher (train_stage4a_updistill_sft_05.py)
 # Uses BASE_MODEL (Qwen/Qwen3.5-2B) so full-vocab 248K KL stays 100% aligned with tied LM head!
 # 8 GPUs * 4 micro_batch * 1 accum * 2048 = 65,536 tokens/step * 4,000 steps = 262.1M tokens
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4A}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4A/7] Running 5-Pillar Focal SFT with Native ${BASE_MODEL} Teacher (65.5k tok/step)..."
+    echo -e "\n>>> [STAGE 4A/8] Running 5-Pillar Focal SFT with Native ${BASE_MODEL} Teacher (65.5k tok/step)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage4a_updistill_sft_05.py \
         --teacher_id "${BASE_MODEL}" \
         --student_base_id "${BASE_MODEL}" \
-        --stage3_ckpt_dir "${CKPT_STAGE3}/best" \
+        --stage3_ckpt_dir "${CKPT_STAGE3B}/best" \
         --pretrain_data_dir "${PRETRAIN_DATA_DIR}" \
         --sft_data_dir "${SFT_DATA_DIR}" \
         --cache_dir "${DATA_ROOT}/hf_cache_5pillar_8k_sft" \
@@ -235,7 +268,7 @@ fi
 # 8 GPUs * 4 micro_batch * 1 accum = 32 pairs/step * 1,250 steps = 40,000 contrastive pairs
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4B}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4B/7] Running 6-Pillar Contrastive DPO + Top-64 Skew-KD from ${POST_TEACHER} (32 pairs/step)..."
+    echo -e "\n>>> [STAGE 4B/8] Running 6-Pillar Contrastive DPO + Top-64 Skew-KD from ${POST_TEACHER} (32 pairs/step)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage4b_dpo_align_06.py \
         --teacher_id "${POST_TEACHER}" \
@@ -297,7 +330,7 @@ fi
 # 8 GPUs * 1 accum * G=8 rollouts = 64 rollouts/step * 250 steps = 16,000 verifiable on-policy rollouts!
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4C/7] Running Gold-Injected Dr. GRPO + Winner-Only ${POST_TEACHER} Top-64 Skew-KD (G=8)..."
+    echo -e "\n>>> [STAGE 4C/8] Running Gold-Injected Dr. GRPO + Winner-Only ${POST_TEACHER} Top-64 Skew-KD (G=8)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage4c_grpo_math_code_07.py \
         --teacher_id "${POST_TEACHER}" \
@@ -345,6 +378,7 @@ fi
 TOTAL_ELAPSED=$(($(date +%s) - PIPELINE_START))
 echo "=================================================================================================="
 echo " ALL BARETORCH PIPELINE STAGES COMPLETED SUCCESSFULLY IN $((TOTAL_ELAPSED / 60))m $((TOTAL_ELAPSED % 60))s!"
+echo "  - Stage 3B 32K Long-Context      : ${CKPT_STAGE3B}/best"
 echo "  - Stage 4A SFT (2B Teacher)      : ${CKPT_STAGE4A}/best"
 echo "  - Stage 4B DPO (4B Skew-KD)      : ${CKPT_STAGE4B}/best"
 echo "  - Stage 4C GRPO (4B OnPolicy-KD) : ${CKPT_STAGE4C}/best"
