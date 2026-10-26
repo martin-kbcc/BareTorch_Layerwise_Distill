@@ -1,6 +1,8 @@
 # Data directories
 data*/
 data*
+checkpoints*/
+checkpoints*
 
 # Lowercase qwen directories and files (checkpoints, caches, features)
 qwen*
