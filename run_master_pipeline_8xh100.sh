@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==================================================================================================
 # MASTER END-TO-END BARETORCH HYBRIDIZATION & DISTILLATION ENGINE (8x NVIDIA H100 SXM5)
-# Converts: Qwen/Qwen3.5-2B (Base Teacher) -> BareTorch-2B CS-LRAD Hybrid
-# Post-Trains & Up-Distills with: Qwen/Qwen3.5-4B (SFT + DistiLLM-2 DPO + Dr. GRPO Math/Code)
+# - Stages 0, 1, 2, 3, 4A (Full-Vocab KD & SFT) : Teacher = Qwen/Qwen3.5-2B (Native Subspace!)
+# - Stages 4B (DPO) & 4C (Dr. GRPO)             : Teacher = Qwen/Qwen3.5-4B (Top-64 Skew-KD!)
 # ==================================================================================================
 set -euo pipefail
 
@@ -12,14 +12,14 @@ set -euo pipefail
 NUM_GPUS=${NUM_GPUS:-8}
 BASE_MODEL=${BASE_MODEL:-"Qwen/Qwen3.5-2B"}
 POST_TEACHER=${POST_TEACHER:-"Qwen/Qwen3.5-4B"}
-MODEL_TAG=${MODEL_TAG:-"2B_from_4B"}
+MODEL_TAG=${MODEL_TAG:-"2B_hybrid"}
 
-# CS-LRAD Architecture Parameters (rank=32 for 2B d_model=2048; use rank=16 for 0.8B d_model=1024)
+# CS-LRAD Architecture Parameters (rank=32 for 2B d_model=2048; rank=16 for 0.8B d_model=1024)
 LRAD_CHUNK_SIZE=${LRAD_CHUNK_SIZE:-64}
 LRAD_RANK=${LRAD_RANK:-32}
 
-# High-speed storage root (defaults to current directory; set STORAGE_ROOT=/scratch on NVMe if mounted)
-STORAGE_ROOT=${STORAGE_ROOT:-"."}
+# High-speed storage root (set STORAGE_ROOT=/scratch on NVMe)
+STORAGE_ROOT=${STORAGE_ROOT:-"/scratch"}
 DATA_ROOT="${STORAGE_ROOT}/data"
 CKPT_ROOT="${STORAGE_ROOT}/checkpoints_${MODEL_TAG}"
 LOG_DIR="${STORAGE_ROOT}/logs_${MODEL_TAG}"
@@ -38,9 +38,9 @@ CKPT_STAGE0="${CKPT_ROOT}/stage0_initialized"
 CKPT_STAGE1="${CKPT_ROOT}/stage1_mixer_aligned"
 CKPT_STAGE2="${CKPT_ROOT}/stage2_end2end_aligned"
 CKPT_STAGE3="${CKPT_ROOT}/stage3_final_distilled"
-CKPT_STAGE4A="${CKPT_ROOT}/stage4a_5pillar_8k"
-CKPT_STAGE4B="${CKPT_ROOT}/stage4b_6pillar_dpo"
-CKPT_STAGE4C="${CKPT_ROOT}/stage4c_grpo_math_code"
+CKPT_STAGE4A="${CKPT_ROOT}/stage4a_5pillar_8k_2B"
+CKPT_STAGE4B="${CKPT_ROOT}/stage4b_6pillar_dpo_4B"
+CKPT_STAGE4C="${CKPT_ROOT}/stage4c_grpo_math_code_4B"
 
 # Dataset Paths
 PRETRAIN_DATA_DIR="${DATA_ROOT}/fineweb_edu_packed_2048"
@@ -51,11 +51,11 @@ ACCEL_CMD="accelerate launch --multi_gpu --num_processes=${NUM_GPUS} --num_machi
 
 echo "=================================================================================================="
 echo " LAUNCHING BARETORCH MASTER DISTILLATION ENGINE ON ${NUM_GPUS}x H100 GPUs"
-echo "  - Base Student Architecture : ${BASE_MODEL} (CS-LRAD chunk_size=${LRAD_CHUNK_SIZE}, rank=${LRAD_RANK})"
-echo "  - Post-Training Teacher     : ${POST_TEACHER} (Stages 4A, 4B, 4C Up-Distillation)"
-echo "  - Checkpoints Directory     : ${CKPT_ROOT}"
-echo "  - Datasets Directory        : ${DATA_ROOT}"
-echo "  - Logs Directory            : ${LOG_DIR}"
+echo "  - Base Student & Stage 1-4A Teacher : ${BASE_MODEL} (CS-LRAD chunk=${LRAD_CHUNK_SIZE}, rank=${LRAD_RANK})"
+echo "  - Stage 4B/4C Top-64 Skew-KD Teacher: ${POST_TEACHER}"
+echo "  - Checkpoints Directory             : ${CKPT_ROOT}"
+echo "  - Datasets Directory                : ${DATA_ROOT}"
+echo "  - Logs Directory                    : ${LOG_DIR}"
 echo "=================================================================================================="
 
 PIPELINE_START=$(date +%s)
@@ -180,14 +180,15 @@ else
 fi
 
 # --------------------------------------------------------------------------------------------------
-# STAGE 4A: 5-Pillar 8K Focal Up-Distillation SFT with 4B Teacher (train_stage4a_updistill_sft_05.py)
+# STAGE 4A: 5-Pillar 8K Focal SFT with NATIVE BASE_MODEL Teacher (train_stage4a_updistill_sft_05.py)
+# Uses BASE_MODEL (Qwen/Qwen3.5-2B) so full-vocab 248K KL stays 100% aligned with tied LM head!
 # 8 GPUs * 2 micro_batch * 1 accum * 2048 = 32,768 tokens/step * 8,000 steps = 262.1M tokens
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4A}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4A/7] Running 5-Pillar 8K Focal SFT & Up-Distillation from ${POST_TEACHER}..."
+    echo -e "\n>>> [STAGE 4A/7] Running 5-Pillar 8K Focal SFT with Native ${BASE_MODEL} Teacher..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage4a_updistill_sft_05.py \
-        --teacher_id "${POST_TEACHER}" \
+        --teacher_id "${BASE_MODEL}" \
         --student_base_id "${BASE_MODEL}" \
         --stage3_ckpt_dir "${CKPT_STAGE3}/best" \
         --pretrain_data_dir "${PRETRAIN_DATA_DIR}" \
@@ -203,7 +204,7 @@ if [ ! -f "${CKPT_STAGE4A}/best/pytorch_model.bin" ]; then
         --num_proc 32 \
         --num_workers 8 \
         --no_grad_checkpointing \
-        2>&1 | tee "${LOG_DIR}/04a_stage4a_updistill_sft.log"
+        2>&1 | tee "${LOG_DIR}/04a_stage4a_sft_2B.log"
     echo ">>> [STAGE 4A DONE] Completed in $(($(date +%s) - T0))s."
 else
     echo ">>> [STAGE 4A SKIP] Found existing ${CKPT_STAGE4A}/best/pytorch_model.bin"
@@ -211,6 +212,7 @@ fi
 
 # --------------------------------------------------------------------------------------------------
 # STAGE 4B: 6-Pillar Contrastive DPO + DistiLLM-2 Top-64 Skew-KD (train_stage4b_dpo_align_06.py)
+# Safely introduces POST_TEACHER (Qwen/Qwen3.5-4B) via Top-64 Skew-KD + 35% DPO Margin Blend!
 # 8 GPUs * 2 micro_batch * 1 accum = 16 pairs/step * 2,500 steps = 40,000 contrastive pairs
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4B}/best/pytorch_model.bin" ]; then
@@ -232,7 +234,7 @@ if [ ! -f "${CKPT_STAGE4B}/best/pytorch_model.bin" ]; then
         --num_proc 32 \
         --num_workers 8 \
         --no_grad_checkpointing \
-        2>&1 | tee "${LOG_DIR}/04b_stage4b_dpo_align.log"
+        2>&1 | tee "${LOG_DIR}/04b_stage4b_dpo_align_4B.log"
     echo ">>> [STAGE 4B DONE] Completed in $(($(date +%s) - T0))s."
 else
     echo ">>> [STAGE 4B SKIP] Found existing ${CKPT_STAGE4B}/best/pytorch_model.bin"
@@ -243,7 +245,7 @@ fi
 # 8 GPUs * 1 accum * G=6 rollouts = 48 rollouts/step * 300 steps = 14,400 on-policy verifiable rollouts!
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4C/7] Running Bridged Dr. GRPO + On-Policy ${POST_TEACHER} Skew-KD (Math & Python Code)..."
+    echo -e "\n>>> [STAGE 4C/7] Running Bridged Dr. GRPO + On-Policy ${POST_TEACHER} Top-64 Skew-KD (Math & Code)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage4c_grpo_math_code_07.py \
         --teacher_id "${POST_TEACHER}" \
@@ -259,7 +261,7 @@ if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
         --eval_steps 50 \
         --save_steps 100 \
         --no_grad_checkpointing \
-        2>&1 | tee "${LOG_DIR}/04c_stage4c_grpo_math_code.log"
+        2>&1 | tee "${LOG_DIR}/04c_stage4c_grpo_math_code_4B.log"
     echo ">>> [STAGE 4C DONE] Completed in $(($(date +%s) - T0))s."
 else
     echo ">>> [STAGE 4C SKIP] Found existing ${CKPT_STAGE4C}/best/pytorch_model.bin"
@@ -268,7 +270,7 @@ fi
 # --------------------------------------------------------------------------------------------------
 # FINAL EVALUATION SUITE: 10-Task Core Benchmark + Generative Math (GSM8K) & Code (MBPP)
 # --------------------------------------------------------------------------------------------------
-echo -e "\n>>> [EVAL 1/2] Running 10-Task lm_eval Suite (Stage 4B & Stage 4C vs. ${BASE_MODEL})..."
+echo -e "\n>>> [EVAL 1/2] Running 10-Task lm_eval Suite (Stage 4B vs. ${BASE_MODEL})..."
 if [ -f "run_lm_eval_benchmarks_04.py" ]; then
     python run_lm_eval_benchmarks_04.py \
         --teacher_id "${BASE_MODEL}" \
@@ -297,7 +299,8 @@ fi
 TOTAL_ELAPSED=$(($(date +%s) - PIPELINE_START))
 echo "=================================================================================================="
 echo " ALL BARETORCH PIPELINE STAGES COMPLETED SUCCESSFULLY IN $((TOTAL_ELAPSED / 60))m $((TOTAL_ELAPSED % 60))s!"
-echo "  - Stage 4B Champion : ${CKPT_STAGE4B}/best"
-echo "  - Stage 4C Champion : ${CKPT_STAGE4C}/best"
-echo "  - Full Reports      : ${LOG_DIR}/"
+echo "  - Stage 4A SFT (2B Teacher)      : ${CKPT_STAGE4A}/best"
+echo "  - Stage 4B DPO (4B Skew-KD)      : ${CKPT_STAGE4B}/best"
+echo "  - Stage 4C GRPO (4B OnPolicy-KD) : ${CKPT_STAGE4C}/best"
+echo "  - Full Reports                   : ${LOG_DIR}/"
 echo "=================================================================================================="
