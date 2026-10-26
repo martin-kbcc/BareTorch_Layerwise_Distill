@@ -319,7 +319,7 @@ if [ ! -f "${LOG_DIR}/generative_eval_stage4b_baseline_${MODEL_TAG}.json" ] && [
         --student_base_id "${BASE_MODEL}" \
         --student_ckpt "${CKPT_STAGE4B}/best" \
         --tasks gsm8k,math500,gpqa,mbpp,humaneval \
-        --batch_size 32 \
+        --batch_size 16 \
         --max_new_tokens 384 \
         --max_new_tokens_reasoning 512 \
         --max_samples 500 \
@@ -373,7 +373,7 @@ if [ -f "run_generative_benchmarks_08.py" ]; then
         --student_base_id "${BASE_MODEL}" \
         --student_ckpt "${CKPT_STAGE4C}/best" \
         --tasks gsm8k,math500,gpqa,mbpp,humaneval \
-        --batch_size 32 \
+        --batch_size 16 \
         --max_new_tokens 384 \
         --max_new_tokens_reasoning 512 \
         --max_samples 500 \
