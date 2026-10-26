@@ -4,7 +4,7 @@
 # - Stage 0 + 0-Verify                          : Surgical Weight Transfer + 6-Point Verification
 # - Stages 1, 2, 3, 4A (Full-Vocab KD & SFT)    : Teacher = Qwen/Qwen3.5-2B (Native Subspace!)
 # - Stage 4B (DPO + Top-64 Skew-KD)             : Teacher = Qwen/Qwen3.5-4B -> Followed by lm_eval!
-# - Stage 4C (Reward-Filtered Dr. GRPO)         : Teacher = Qwen/Qwen3.5-4B -> Followed by GSM8K/MBPP!
+# - Stage 4C (Gold-Injected Dr. GRPO + Skew-KD) : Teacher = Qwen/Qwen3.5-4B -> Followed by GSM8K/MBPP!
 # ==================================================================================================
 set -euo pipefail
 
@@ -293,11 +293,11 @@ if [ ! -f "${LOG_DIR}/generative_eval_stage4b_baseline_${MODEL_TAG}.json" ] && [
 fi
 
 # --------------------------------------------------------------------------------------------------
-# STAGE 4C: Reward-Filtered Dr. GRPO + On-Policy Top-64 Skew-KD from POST_TEACHER (4B)
+# STAGE 4C: Gold-Injected Contrastive Dr. GRPO + Winner-Only Top-64 Skew-KD from POST_TEACHER (4B)
 # 8 GPUs * 1 accum * G=8 rollouts = 64 rollouts/step * 250 steps = 16,000 verifiable on-policy rollouts!
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4C/7] Running Reward-Filtered Dr. GRPO + On-Policy ${POST_TEACHER} Top-64 Skew-KD (G=8)..."
+    echo -e "\n>>> [STAGE 4C/7] Running Gold-Injected Dr. GRPO + Winner-Only ${POST_TEACHER} Top-64 Skew-KD (G=8)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage4c_grpo_math_code_07.py \
         --teacher_id "${POST_TEACHER}" \
@@ -306,11 +306,16 @@ if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
         --output_dir "${CKPT_STAGE4C}" \
         --group_size 8 \
         --grad_accum_steps 1 \
-        --lrad_lr 8.0e-6 \
-        --backbone_lr 2.5e-6 \
+        --lrad_lr 2.0e-5 \
+        --backbone_lr 5.0e-6 \
+        --grpo_weight 0.45 \
+        --opd_skew_weight 0.35 \
+        --gold_cot_weight 0.20 \
+        --beta_ref_kl 0.03 \
         --max_steps 250 \
         --logit_chunk_size 128 \
         --eval_steps 50 \
+        --eval_prompts 60 \
         --save_steps 50 \
         --no_grad_checkpointing \
         2>&1 | tee "${LOG_DIR}/04c_stage4c_grpo_math_code_4B.log"
