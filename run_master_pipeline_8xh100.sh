@@ -5,8 +5,8 @@
 # - Stages 1, 2, 3 (2K Pretrain KD)              : Teacher = Qwen/Qwen3.5-2B (Native Subspace!)
 # - Stage 3B (32K Long-Context Horizon Extension): Teacher = Qwen/Qwen3.5-2B (512-Chunk Calibration!)
 # - Stage 4A (5-Pillar Focal SFT & KD)           : Teacher = Qwen/Qwen3.5-2B (Native Subspace!)
-# - Stage 4B (DPO + Top-64 Skew-KD)              : Teacher = Qwen/Qwen3.5-4B -> Followed by lm_eval!
-# - Stage 4C (Gold-Injected Dr. GRPO + Skew-KD)  : Teacher = Qwen/Qwen3.5-4B -> Followed by GSM8K/MBPP!
+# - Stage 4B (DPO + Top-64 Skew-KD)              : Teacher = Qwen/Qwen3.5-4B -> Followed by lm_eval & 5-Task Gen!
+# - Stage 4C (4-Pillar <think> Dr. GRPO + KD)    : Teacher = Qwen/Qwen3.5-4B -> Followed by 5-Task Gen Suite!
 # ==================================================================================================
 set -euo pipefail
 
@@ -297,7 +297,7 @@ fi
 # --------------------------------------------------------------------------------------------------
 # POST-STAGE 4B BENCHMARKS:
 # 1. Full 10-Task Non-Generative lm_eval Benchmark Suite (Stage 4B vs. Base Teacher)
-# 2. Pre-GRPO Generative Baseline (GSM8K + MBPP) for Teacher & Stage 4B Student
+# 2. Pre-GRPO 5-Task Generative Baseline (GSM8K, MATH-500, GPQA, MBPP, HumanEval)
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${LOG_DIR}/lm_eval_stage4b_${MODEL_TAG}.json" ] && [ -f "run_lm_eval_benchmarks_04.py" ]; then
     echo -e "\n>>> [EVAL STAGE 4B - 1/2] Running 10-Task Non-Generative lm_eval Suite (Stage 4B vs. ${BASE_MODEL})..."
@@ -313,24 +313,26 @@ if [ ! -f "${LOG_DIR}/lm_eval_stage4b_${MODEL_TAG}.json" ] && [ -f "run_lm_eval_
 fi
 
 if [ ! -f "${LOG_DIR}/generative_eval_stage4b_baseline_${MODEL_TAG}.json" ] && [ -f "run_generative_benchmarks_08.py" ]; then
-    echo -e "\n>>> [EVAL STAGE 4B - 2/2] Running Pre-GRPO Generative Baseline (GSM8K & MBPP: ${BASE_MODEL} vs. Stage 4B)..."
+    echo -e "\n>>> [EVAL STAGE 4B - 2/2] Running Pre-GRPO 5-Task Generative Suite (GSM8K, MATH-500, GPQA, MBPP, HumanEval)..."
     ${ACCEL_CMD} run_generative_benchmarks_08.py \
         --teacher_id "${BASE_MODEL}" \
         --student_base_id "${BASE_MODEL}" \
         --student_ckpt "${CKPT_STAGE4B}/best" \
+        --tasks gsm8k,math500,gpqa,mbpp,humaneval \
         --batch_size 32 \
-        --max_new_tokens 256 \
+        --max_new_tokens 384 \
+        --max_new_tokens_reasoning 512 \
         --max_samples 500 \
         --output_json "${LOG_DIR}/generative_eval_stage4b_baseline_${MODEL_TAG}.json" \
         2>&1 | tee "${LOG_DIR}/05b_eval_generative_stage4b_baseline.log"
 fi
 
 # --------------------------------------------------------------------------------------------------
-# STAGE 4C: Gold-Injected Contrastive Dr. GRPO + Winner-Only Top-64 Skew-KD from POST_TEACHER (4B)
+# STAGE 4C: 4-Pillar <think>-Guided Dr. GRPO + Winner-Only Top-64 Skew-KD from POST_TEACHER (4B)
 # 8 GPUs * 1 accum * G=8 rollouts = 64 rollouts/step * 250 steps = 16,000 verifiable on-policy rollouts!
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4C/8] Running Gold-Injected Dr. GRPO + Winner-Only ${POST_TEACHER} Top-64 Skew-KD (G=8)..."
+    echo -e "\n>>> [STAGE 4C/8] Running 4-Pillar <think>-Guided Dr. GRPO + Winner-Only ${POST_TEACHER} Top-64 Skew-KD (G=8)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage4c_grpo_math_code_07.py \
         --teacher_id "${POST_TEACHER}" \
@@ -338,13 +340,15 @@ if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
         --input_ckpt_dir "${CKPT_STAGE4B}/best" \
         --output_dir "${CKPT_STAGE4C}" \
         --group_size 8 \
+        --max_prompt_len 384 \
+        --max_new_tokens 320 \
         --grad_accum_steps 1 \
         --lrad_lr 2.0e-5 \
         --backbone_lr 5.0e-6 \
-        --grpo_weight 0.45 \
-        --opd_skew_weight 0.35 \
+        --grpo_weight 0.40 \
+        --opd_skew_weight 0.40 \
         --gold_cot_weight 0.20 \
-        --beta_ref_kl 0.03 \
+        --beta_ref_kl 0.04 \
         --max_steps 250 \
         --logit_chunk_size 128 \
         --eval_steps 50 \
@@ -359,18 +363,22 @@ fi
 
 # --------------------------------------------------------------------------------------------------
 # POST-STAGE 4C BENCHMARKS:
-# Generative Math (GSM8K) & Code (MBPP) Evaluation (--skip_teacher since Teacher was already scored in 05b!)
+# 5-Task Generative Evaluation (GSM8K, MATH-500, GPQA, MBPP, HumanEval)
+# Uses --skip_teacher and --teacher_baseline_json to auto-load Teacher scores from 05b!
 # --------------------------------------------------------------------------------------------------
 if [ -f "run_generative_benchmarks_08.py" ]; then
-    echo -e "\n>>> [EVAL STAGE 4C] Running Post-GRPO Multi-GPU Generative Math (GSM8K) & Code (MBPP) Suite..."
+    echo -e "\n>>> [EVAL STAGE 4C] Running Post-GRPO 5-Task Generative Suite (GSM8K, MATH-500, GPQA, MBPP, HumanEval)..."
     ${ACCEL_CMD} run_generative_benchmarks_08.py \
         --teacher_id "${BASE_MODEL}" \
         --student_base_id "${BASE_MODEL}" \
         --student_ckpt "${CKPT_STAGE4C}/best" \
+        --tasks gsm8k,math500,gpqa,mbpp,humaneval \
         --batch_size 32 \
-        --max_new_tokens 256 \
+        --max_new_tokens 384 \
+        --max_new_tokens_reasoning 512 \
         --max_samples 500 \
         --skip_teacher \
+        --teacher_baseline_json "${LOG_DIR}/generative_eval_stage4b_baseline_${MODEL_TAG}.json" \
         --output_json "${LOG_DIR}/generative_eval_stage4c_${MODEL_TAG}.json" \
         2>&1 | tee "${LOG_DIR}/06_eval_generative_stage4c.log"
 fi
