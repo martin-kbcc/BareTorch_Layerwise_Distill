@@ -30,9 +30,9 @@ torch.set_float32_matmul_precision("high")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Stage 4C: Reward-Filtered Dr. GRPO + On-Policy Top-64 Skew-KD for Generative Math (GSM8K) & Code (MBPP)"
+        description="Stage 4C: Gold-Injected Contrastive Dr. GRPO + On-Policy Top-64 Skew-KD for Math (GSM8K) & Code (MBPP)"
     )
-    parser.add_argument("--teacher_id", type=str, default="Qwen/Qwen3.5-2B", help="Larger Teacher for On-Policy Top-K Skew-KD")
+    parser.add_argument("--teacher_id", type=str, default="Qwen/Qwen3.5-2B", help="Larger Teacher for Top-64 Skew-KD")
     parser.add_argument("--student_base_id", type=str, default="Qwen/Qwen3.5-0.8B", help="Base model ID for Student structure")
     parser.add_argument(
         "--input_ckpt_dir",
@@ -48,33 +48,33 @@ def parse_args():
     )
 
     # GRPO Rollout & Optimization Hyperparameters
-    parser.add_argument("--group_size", type=int, default=4, help="Number of on-policy rollouts G per prompt")
+    parser.add_argument("--group_size", type=int, default=4, help="Number of rollouts G per prompt")
     parser.add_argument("--max_prompt_len", type=int, default=320)
     parser.add_argument("--max_new_tokens", type=int, default=256, help="Max generated CoT / Code tokens per rollout")
-    parser.add_argument("--rollout_temp", type=float, default=0.70, help="Sampling temperature for group rollouts")
-    parser.add_argument("--rollout_top_p", type=float, default=0.90)
-    parser.add_argument("--lrad_lr", type=float, default=8.0e-6, help="Conservative Peak GRPO LR for CS-LRAD recurrent layers")
-    parser.add_argument("--backbone_lr", type=float, default=2.5e-6, help="Conservative Peak GRPO LR for Backbone MLPs & Full-Attn")
+    parser.add_argument("--rollout_temp", type=float, default=0.75, help="Sampling temperature for group rollouts")
+    parser.add_argument("--rollout_top_p", type=float, default=0.92)
+    parser.add_argument("--lrad_lr", type=float, default=2.5e-5, help="Effective Peak GRPO LR for CS-LRAD recurrent layers")
+    parser.add_argument("--backbone_lr", type=float, default=6.0e-6, help="Effective Peak GRPO LR for Backbone MLPs & Full-Attn")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps across prompt groups")
-    parser.add_argument("--max_steps", type=int, default=300, help="300 Reward-Filtered Dr. GRPO + On-Policy KD steps")
+    parser.add_argument("--max_steps", type=int, default=300, help="300 Gold-Injected Dr. GRPO + Top-64 Skew-KD steps")
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
-    # Dr. GRPO + Reward-Gated On-Policy Skew-KD + Gold CoT Anchor Weights
+    # Gold-Injected Dr. GRPO + Positive-Only Skew-KD + NLL Anchor Weights
     parser.add_argument("--clip_eps", type=float, default=0.20, help="PPO/GRPO clipping epsilon")
-    parser.add_argument("--beta_ref_kl", type=float, default=0.05, help="Schulman K3 Reference KL penalty weight")
-    parser.add_argument("--grpo_weight", type=float, default=0.50, help="Weight on verifiable Dr. GRPO policy gradient loss")
-    parser.add_argument("--opd_skew_weight", type=float, default=0.25, help="Weight on Reward-Gated On-Policy Top-64 Skew-KD")
-    parser.add_argument("--gold_cot_weight", type=float, default=0.25, help="Weight on Verified Gold CoT + Code Top-64 Skew-KD + NLL")
+    parser.add_argument("--beta_ref_kl", type=float, default=0.03, help="Schulman K3 Reference KL penalty weight")
+    parser.add_argument("--grpo_weight", type=float, default=0.45, help="Weight on contrastive Dr. GRPO policy gradient loss")
+    parser.add_argument("--opd_skew_weight", type=float, default=0.35, help="Weight on Verified-Winner Top-64 Skew-KL + Skew-RKL")
+    parser.add_argument("--gold_cot_weight", type=float, default=0.20, help="Weight on Verified-Winner token NLL anchor")
     parser.add_argument("--topk_logits", type=int, default=64)
     parser.add_argument("--skew_alpha", type=float, default=0.1)
-    parser.add_argument("--logit_chunk_size", type=int, default=64, help="64-token vocab chunk size to keep peak VRAM < 14GB")
+    parser.add_argument("--logit_chunk_size", type=int, default=64, help="64-token vocab chunk size to keep peak VRAM < 12GB")
 
     # Logging, Eval, Compilation & Saving
     parser.add_argument("--log_steps", type=int, default=10)
     parser.add_argument("--eval_steps", type=int, default=50)
-    parser.add_argument("--eval_prompts", type=int, default=40, help="40 held-out validation problems (20 GSM8K + 20 MBPP)")
+    parser.add_argument("--eval_prompts", type=int, default=60, help="60 held-out validation problems (30 GSM8K + 30 MBPP)")
     parser.add_argument("--save_steps", type=int, default=50)
     parser.add_argument("--no_grad_checkpointing", action="store_true")
     parser.add_argument("--no_compile", action="store_true", help="Disable torch.compile if set")
@@ -83,7 +83,7 @@ def parse_args():
 
 
 # ==============================================================================
-# 1. Strict Verifiable Reward (RLVR) Engines (Zero Format Reward Hacking!)
+# 1. Strict Verifiable Reward (RLVR) Engines for Math (GSM8K) & Code (MBPP)
 # ==============================================================================
 NUM_REGEX = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
 
@@ -151,11 +151,6 @@ def extract_math_number(text: str):
 
 
 def verify_math_reward(generated_text: str, gold_target: str) -> tuple[float, bool]:
-    """
-    Strict RLVR Math Verifier:
-      - Incorrect final answer gets at most 0.05 (so wrong answers are NEVER reinforced over correct ones).
-      - Exact numerical match gets +1.00, plus +0.20 if formatted with `#### <number>` and multi-step CoT.
-    """
     clean_text = truncate_at_stop_sequences(generated_text, "math")
     pred_str = extract_math_number(clean_text)
     is_correct = False
@@ -169,15 +164,11 @@ def verify_math_reward(generated_text: str, gold_target: str) -> tuple[float, bo
 
     if is_correct:
         reward = 1.0
-        if "####" in clean_text:
-            cot_part = clean_text.split("####")[0].strip()
-            if len(cot_part) >= 20:
-                reward += 0.20
+        if "####" in clean_text and len(clean_text.split("####")[0].strip()) >= 20:
+            reward += 0.20
         return reward, True
     else:
-        # Tiny 0.05 format indicator ONLY, never enough to beat a correct rollout (1.20)
-        fmt_bonus = 0.05 if ("####" in clean_text and len(clean_text.split("####")[0].strip()) >= 25) else 0.0
-        return fmt_bonus, False
+        return 0.0, False
 
 
 def extract_python_code(text: str, func_sig_hint: str = "") -> str:
@@ -207,7 +198,6 @@ def verify_code_reward(generated_text: str, test_list: list[str], func_sig_hint:
     except SyntaxError:
         return 0.0, False
 
-    # Valid Python AST gets a small 0.10 baseline; passing unit tests gets +1.10!
     reward = 0.10
     if not test_list:
         return reward, False
@@ -250,7 +240,7 @@ class MathCodeGRPODataset(TorchDataset):
         return self.items[idx]
 
 
-def build_math_code_grpo_splits(seed=777, val_prompts=40):
+def build_math_code_grpo_splits(seed=777, val_prompts=60):
     rng = random.Random(seed)
     math_items, code_items = [], []
 
@@ -261,7 +251,6 @@ def build_math_code_grpo_splits(seed=777, val_prompts=40):
         if q and "####" in ans_full:
             clean_cot = re.sub(r"<<[^>]+>>", "", ans_full).strip()
             gold_num = clean_cot.split("####")[-1].strip().replace(",", "")
-            # Use the exact same 2-shot CoT prefix as `run_generative_benchmarks_08.py`!
             prompt_str = f"{GSM8K_2SHOT_PREFIX}Question: {q}\nAnswer: Let's think step by step.\n"
             math_items.append({
                 "task_type": "math",
@@ -304,7 +293,7 @@ def build_math_code_grpo_splits(seed=777, val_prompts=40):
     rng.shuffle(math_items)
     rng.shuffle(code_items)
 
-    val_half = max(10, val_prompts // 2)
+    val_half = max(15, val_prompts // 2)
     val_set = math_items[:val_half] + code_items[:val_half]
     train_math = math_items[val_half:]
     train_code = code_items[val_half:]
@@ -318,7 +307,7 @@ def build_math_code_grpo_splits(seed=777, val_prompts=40):
 
 
 # ==============================================================================
-# 3. Reward-Gated Dr. GRPO + On-Policy Top-64 Skew-KD + Gold CoT Anchor
+# 3. Unified Single-Pass Gold-Injected Dr. GRPO + Winner-Only Top-64 Skew-KD
 # ==============================================================================
 def _fast_token_logprobs_and_topk(logits: torch.Tensor, target_ids: torch.Tensor, topk: int = 0):
     lse = torch.logsumexp(logits, dim=-1)
@@ -331,27 +320,30 @@ def _fast_token_logprobs_and_topk(logits: torch.Tensor, target_ids: torch.Tensor
     return tok_lp, None, None
 
 
-def chunked_onpolicy_grpo_and_skew_kd(
+def chunked_gold_injected_grpo_and_skew_kd(
     h_pol,
     h_ref,
     h_teach,
     target_ids,
     resp_mask,
     advantages,
-    opd_weights,
+    winner_mask,
     pol_lm_head,
     ref_lm_head,
     teach_lm_head,
-    max_new_tokens=256,
     topk=64,
     skew_alpha=0.1,
-    beta_ref_kl=0.05,
+    beta_ref_kl=0.03,
     chunk_size=64,
 ):
     """
-    1. True Dr. GRPO normalization: divides policy gradient by `G * max_new_tokens` (unbiased wrt length).
-    2. Reward-Gated On-Policy Skew-KD (`opd_weights`): ONLY distills the 2B/4B Teacher on verified/positive
-       rollouts (`opd_weights[i] > 0`), NEVER on wrong arithmetic rollouts!
+    Unified Single-Pass Contrastive Dr. GRPO + Winner-Only Top-64 Skew-KD + Winner NLL:
+      - `advantages`: Zero-mean group advantages across the G trajectories (where at least 1 trajectory
+        in the group is ALWAYS a verified `+1.20` winner—either on-policy or Gold-injected!).
+      - `winner_mask`: `1.0` strictly on verified correct trajectories (`is_correct == True`), `0.0` on failed ones.
+      - On `winner_mask == 1.0` trajectories: applies Top-64 Skew-KL + Skew-RKL against the Larger Teacher + NLL.
+      - On `advantages < 0.0` failed on-policy trajectories: applies negative Dr. GRPO gradient (with lower-bound
+        log-ratio clamp `-1.5` so negative updates push down errors without destabilizing representation!).
     """
     p_dtype = pol_lm_head.weight.dtype
     r_dtype = ref_lm_head.weight.dtype
@@ -365,7 +357,7 @@ def chunked_onpolicy_grpo_and_skew_kd(
     shift_mask = resp_mask[:, 1:].float()
     B, L_m1, _ = h_p_s.shape
     adv_col = advantages.view(B, 1)
-    opd_col = opd_weights.view(B, 1)
+    win_col = winner_mask.view(B, 1)
 
     def _chunk_fn(hp_c, hr_c, ht_c, tgt_c, m_c):
         v_min = min(pol_lm_head.weight.size(0), teach_lm_head.weight.size(0))
@@ -384,23 +376,33 @@ def chunked_onpolicy_grpo_and_skew_kd(
         logits_p_k = logits_p.gather(-1, top_idx_t)
         del logits_p
 
-        # 1. Unbiased Dr. GRPO Surrogate (`ratio = exp(logp - logp.detach())`)
+        # 1. Contrastive Dr. GRPO Surrogate:
+        # Gate negative updates when log(pi_pol / pi_ref) < -1.5 so we never push down already-unlikely tokens!
+        log_ratio_ref = (tok_logp_p - tok_logp_r).clamp(min=-10.0, max=10.0)
+        neg_gate = torch.where((adv_col < 0.0) & (log_ratio_ref.detach() < -1.5), torch.zeros_like(adv_col), torch.ones_like(adv_col))
         ratio = torch.exp(tok_logp_p - tok_logp_p.detach())
-        pg_tok = (-ratio * adv_col) * m_c
+        pg_tok = (-ratio * adv_col * neg_gate) * m_c
 
-        # 2. Schulman K3 Reference KL penalty (protects Stage 4B 57.50% knowledge!)
-        log_diff_ref = (tok_logp_r - tok_logp_p).clamp(min=-10.0, max=10.0)
+        # 2. Schulman K3 Reference KL penalty
+        log_diff_ref = (-log_ratio_ref).clamp(min=-10.0, max=10.0)
         k3_ref_kl = (torch.exp(log_diff_ref) - log_diff_ref - 1.0) * m_c
 
-        # 3. Reward-Gated On-Policy Mode-Seeking Top-64 Skew-Reverse-KL (ONLY on positive/correct rollouts!)
+        # 3. Winner-Only Top-64 Skew-KL + Skew-Reverse-KL against Larger Teacher
         probs_p_k = F.softmax(logits_p_k, dim=-1).clamp(min=1e-8)
+        mixed_q = (skew_alpha * probs_t_k + (1.0 - skew_alpha) * probs_p_k).clamp(min=1e-8)
+        skl_tok = (probs_t_k * (probs_t_k.log() - mixed_q.log())).sum(dim=-1)
+
         mixed_p = ((1.0 - skew_alpha) * probs_t_k + skew_alpha * probs_p_k).clamp(min=1e-8)
         srkl_tok = (probs_p_k * (probs_p_k.log() - mixed_p.log())).sum(dim=-1)
-        opd_chunk = (srkl_tok * m_c * opd_col).sum()
 
-        return pg_tok.sum(), k3_ref_kl.sum(), opd_chunk, k3_ref_kl.detach().sum()
+        skew_kd_tok = 0.5 * skl_tok + 0.5 * srkl_tok
+        win_m_c = m_c * win_col
+        opd_chunk = (skew_kd_tok * win_m_c).sum()
+        nll_chunk = (-tok_logp_p * win_m_c).sum()
 
-    total_pg, total_k3, total_opd, total_rkl_det = 0.0, 0.0, 0.0, 0.0
+        return pg_tok.sum(), k3_ref_kl.sum(), opd_chunk, nll_chunk, k3_ref_kl.detach().sum()
+
+    total_pg, total_k3, total_opd, total_nll, total_rkl_det = 0.0, 0.0, 0.0, 0.0, 0.0
     for start in range(0, L_m1, chunk_size):
         end = min(start + chunk_size, L_m1)
         hp_c = h_p_s[:, start:end, :].contiguous()
@@ -410,86 +412,25 @@ def chunked_onpolicy_grpo_and_skew_kd(
         m_c = shift_mask[:, start:end].contiguous()
 
         if h_pol.requires_grad:
-            pg_c, k3_c, opd_c, rkl_c = checkpoint.checkpoint(_chunk_fn, hp_c, hr_c, ht_c, tgt_c, m_c, use_reentrant=False)
+            pg_c, k3_c, opd_c, nll_c, rkl_c = checkpoint.checkpoint(
+                _chunk_fn, hp_c, hr_c, ht_c, tgt_c, m_c, use_reentrant=False
+            )
         else:
-            pg_c, k3_c, opd_c, rkl_c = _chunk_fn(hp_c, hr_c, ht_c, tgt_c, m_c)
+            pg_c, k3_c, opd_c, nll_c, rkl_c = _chunk_fn(hp_c, hr_c, ht_c, tgt_c, m_c)
 
         total_pg = total_pg + pg_c
         total_k3 = total_k3 + k3_c
         total_opd = total_opd + opd_c
+        total_nll = total_nll + nll_c
         total_rkl_det = total_rkl_det + rkl_c
 
-    # Dr. GRPO fixed denominator (`B * max_new_tokens`) prevents length bias & keeps gradients strong
-    dr_grpo_denom = float(B * max_new_tokens)
     tok_denom = shift_mask.sum().clamp(min=1.0)
-    opd_denom = (shift_mask * opd_col).sum().clamp(min=1.0)
+    win_denom = (shift_mask * win_col).sum().clamp(min=1.0)
 
-    grpo_loss = (total_pg / dr_grpo_denom) + beta_ref_kl * (total_k3 / tok_denom)
-    opd_loss = total_opd / opd_denom
-    return grpo_loss, opd_loss, total_rkl_det / tok_denom
-
-
-def chunked_gold_cot_anchor(
-    h_pol,
-    h_teach,
-    gold_ids,
-    gold_mask,
-    pol_lm_head,
-    teach_lm_head,
-    topk=64,
-    skew_alpha=0.1,
-    chunk_size=64,
-):
-    p_dtype = pol_lm_head.weight.dtype
-    t_dtype = teach_lm_head.weight.dtype
-
-    h_p_s = h_pol[:, :-1, :].to(p_dtype)
-    h_t_s = h_teach[:, :-1, :].detach().to(t_dtype)
-    shift_tgt = gold_ids[:, 1:].clamp(min=0)
-    shift_m = gold_mask[:, 1:].float()
-    L_m1 = h_p_s.size(1)
-
-    def _chunk_fn(hp_c, ht_c, tgt_c, m_c):
-        v_min = min(pol_lm_head.weight.size(0), teach_lm_head.weight.size(0))
-        with torch.no_grad():
-            logits_t = teach_lm_head(ht_c.to(t_dtype)).float()[..., :v_min]
-            _, probs_t_k, top_idx_t = _fast_token_logprobs_and_topk(logits_t, tgt_c, topk=topk)
-            del logits_t
-
-        logits_p = pol_lm_head(hp_c.to(p_dtype)).float()[..., :v_min]
-        tok_logp_p, _, _ = _fast_token_logprobs_and_topk(logits_p, tgt_c, topk=0)
-        nll_tok = -tok_logp_p
-        logits_p_k = logits_p.gather(-1, top_idx_t)
-        del logits_p
-
-        probs_p_k = F.softmax(logits_p_k, dim=-1).clamp(min=1e-8)
-
-        mixed_q = (skew_alpha * probs_t_k + (1.0 - skew_alpha) * probs_p_k).clamp(min=1e-8)
-        skl_tok = (probs_t_k * (probs_t_k.log() - mixed_q.log())).sum(dim=-1)
-
-        mixed_p = ((1.0 - skew_alpha) * probs_t_k + skew_alpha * probs_p_k).clamp(min=1e-8)
-        srkl_tok = (probs_p_k * (probs_p_k.log() - mixed_p.log())).sum(dim=-1)
-
-        # Emphasize Top-64 Teacher Skew-KD (70%) + gentle NLL (30%) so the model doesn't overfit to early EOS
-        gold_loss_tok = 0.70 * (0.5 * skl_tok + 0.5 * srkl_tok) + 0.30 * nll_tok
-        return (gold_loss_tok * m_c).sum(), (nll_tok.detach() * m_c).sum()
-
-    tot_loss, tot_ce = 0.0, 0.0
-    for start in range(0, L_m1, chunk_size):
-        end = min(start + chunk_size, L_m1)
-        hp_c = h_p_s[:, start:end, :].contiguous()
-        ht_c = h_t_s[:, start:end, :].contiguous()
-        tgt_c = shift_tgt[:, start:end].contiguous()
-        m_c = shift_m[:, start:end].contiguous()
-        if h_pol.requires_grad:
-            l_c, ce_c = checkpoint.checkpoint(_chunk_fn, hp_c, ht_c, tgt_c, m_c, use_reentrant=False)
-        else:
-            l_c, ce_c = _chunk_fn(hp_c, ht_c, tgt_c, m_c)
-        tot_loss = tot_loss + l_c
-        tot_ce = tot_ce + ce_c
-
-    denom = shift_m.sum().clamp(min=1.0)
-    return tot_loss / denom, tot_ce / denom
+    grpo_loss = (total_pg / tok_denom) + beta_ref_kl * (total_k3 / tok_denom)
+    opd_loss = total_opd / win_denom
+    win_nll_loss = total_nll / win_denom
+    return grpo_loss, opd_loss, win_nll_loss, total_rkl_det / tok_denom
 
 
 class Stage4Wrapper(nn.Module):
@@ -576,12 +517,24 @@ def main():
     train_ds, val_ds, n_math, n_code = build_math_code_grpo_splits(seed=args.seed, val_prompts=args.eval_prompts)
     accelerator.wait_for_everyone()
 
-    _, base_08b_backbone, _ = load_qwen3_5_text_teacher(args.student_base_id, dtype=torch.bfloat16, device="cpu")
-    student = load_hybrid_student_checkpoint(
-        ckpt_to_load, teacher_backbone=base_08b_backbone, teacher_id=args.student_base_id, dtype=torch.bfloat16
-    )
-    del base_08b_backbone
-    gc.collect()
+    if accelerator.is_main_process:
+        print(f"Loading Larger Skew-KD Teacher: {args.teacher_id} ...")
+    teacher, t_backbone, _ = load_qwen3_5_text_teacher(args.teacher_id, dtype=torch.bfloat16, device="cpu")
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    if args.student_base_id == args.teacher_id:
+        student = load_hybrid_student_checkpoint(
+            ckpt_to_load, teacher_backbone=t_backbone, teacher_id=args.teacher_id, dtype=torch.bfloat16
+        )
+    else:
+        _, base_08b_backbone, _ = load_qwen3_5_text_teacher(args.student_base_id, dtype=torch.bfloat16, device="cpu")
+        student = load_hybrid_student_checkpoint(
+            ckpt_to_load, teacher_backbone=base_08b_backbone, teacher_id=args.student_base_id, dtype=torch.bfloat16
+        )
+        del base_08b_backbone
+        gc.collect()
 
     if getattr(student.config, "tie_word_embeddings", True):
         student.lm_head.weight = student.model.token_embedding.weight
@@ -594,21 +547,11 @@ def main():
     if use_gc:
         student.gradient_checkpointing_enable()
 
-    if accelerator.is_main_process:
-        print(f"Loading Larger On-Policy Skew-KD Teacher: {args.teacher_id} ...")
-    teacher, t_backbone, _ = load_qwen3_5_text_teacher(args.teacher_id, dtype=torch.bfloat16, device="cpu")
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
-
     t_backbone.to(accelerator.device)
     teacher.lm_head.to(accelerator.device)
     ref_student.to(accelerator.device)
     student.to(accelerator.device)
 
-    # Compile ONLY the frozen full-sequence Reference & Teacher backbones (which always run in no_grad + static mode)
-    # Avoiding torch.compile on student's chunk_forward prevents Dynamo recompilation when switching between
-    # eval/no_grad (.generate prefill) and train/enable_grad (Pass A/B)!
     if not args.no_compile:
         if accelerator.is_main_process:
             print("  - Compiling frozen Reference & Teacher backbones...")
@@ -650,14 +593,15 @@ def main():
     wrapper.train()
 
     if accelerator.is_main_process:
-        print("=" * 92)
-        print("STAGE 4C: REWARD-FILTERED DR. GRPO + ON-POLICY TOP-64 SKEW-KD (MATH CoT & PYTHON CODE)")
+        print("=" * 94)
+        print("STAGE 4C: GOLD-INJECTED CONTRASTIVE DR. GRPO + TOP-64 SKEW-KD (MATH CoT & PYTHON CODE)")
         print(f"  - Starting Checkpoint  : {ckpt_to_load}")
-        print(f"  - Larger Teacher       : {args.teacher_id} (Reward-Gated On-Policy Top-{args.topk_logits} Skew-RKL + Gold CoT)")
+        print(f"  - Larger Teacher       : {args.teacher_id} (Winner-Only Top-{args.topk_logits} Skew-KD + Contrastive GRPO)")
         print(f"  - Verifiable Tasks     : {n_math:,} GSM8K (2-Shot CoT) + {n_code:,} MBPP (1-Shot Python Unit-Tests)")
-        print(f"  - Group Rollout Size   : G={args.group_size} rollouts/prompt (max_new_tokens={args.max_new_tokens}, T={args.rollout_temp})")
-        print(f"  - Loss Formulation     : {args.grpo_weight}*Dr.GRPO + {args.opd_skew_weight}*PosOnly_OPD_SkewRKL + {args.gold_cot_weight}*Gold_CoT")
-        print("=" * 92)
+        print(f"  - Group Rollout Size   : G={args.group_size} rollouts/prompt (Gold-Injected when all G fail -> 100% active steps!)")
+        print(f"  - Peak Learning Rates  : LRAD={args.lrad_lr:.2e} | Backbone={args.backbone_lr:.2e}")
+        print(f"  - Loss Formulation     : {args.grpo_weight}*Dr.GRPO + {args.opd_skew_weight}*Winner_SkewKD + {args.gold_cot_weight}*Winner_NLL")
+        print("=" * 94)
 
     accelerator.wait_for_everyone()
     init_math, init_code, init_rew = evaluate_math_code_greedy(accelerator, wrapper, tokenizer, val_ds, args)
@@ -702,7 +646,7 @@ def main():
                 )
             unwrapped_student.train()
 
-            # 2. Truncate rollouts cleanly at stop delimiters (`\nQuestion:` or closing ```), pad to multiple of 64
+            # 2. Score all G on-policy rollouts
             cleaned_seqs = []
             end_lengths = []
             rewards = []
@@ -722,10 +666,28 @@ def main():
                 rewards.append(r_val)
                 correct_flags.append(float(is_c))
 
-                clean_comp_ids = tokenizer(clean_txt, add_special_tokens=False, truncation=True, max_length=args.max_new_tokens - 1)["input_ids"] + [eos_id]
-                full_seq = p_ids + clean_comp_ids
-                cleaned_seqs.append(full_seq)
+                clean_comp_ids = tokenizer(
+                    clean_txt, add_special_tokens=False, truncation=True, max_length=args.max_new_tokens - 1
+                )["input_ids"] + [eos_id]
+                cleaned_seqs.append(p_ids + clean_comp_ids)
                 end_lengths.append(len(clean_comp_ids))
+
+            onpolicy_any_correct = float(any(correct_flags))
+            onpolicy_mean_rew = sum(rewards) / max(len(rewards), 1)
+
+            # 3. GOLD-INJECTED GROUP GUARANTEE:
+            # If none of the G on-policy rollouts solved the problem (or Even if they did, to anchor against drift),
+            # replace the lowest-reward rollout slot with the verified Gold CoT / Python solution (`reward = 1.20`)!
+            # This guarantees 100% of groups have a verified `+1.20` winner AND active contrastive Dr. GRPO advantages!
+            if not any(correct_flags):
+                gold_comp_ids = tokenizer(
+                    item["gold_completion"], add_special_tokens=False, truncation=True, max_length=args.max_new_tokens - 1
+                )["input_ids"] + [eos_id]
+                replace_idx = int(torch.tensor(rewards).argmin().item())
+                cleaned_seqs[replace_idx] = p_ids + gold_comp_ids
+                end_lengths[replace_idx] = len(gold_comp_ids)
+                rewards[replace_idx] = 1.20
+                correct_flags[replace_idx] = 1.0
 
             max_seq_l = max(len(s) for s in cleaned_seqs)
             target_len = min(640, ((max_seq_l + c_align - 1) // c_align) * c_align)
@@ -742,22 +704,6 @@ def main():
 
             gen_seqs_aligned = torch.tensor(padded_batch, dtype=torch.long, device=accelerator.device)
 
-            # 3. Prepare the Gold CoT / Python solution sequence
-            gold_full = tokenizer(
-                item["prompt"] + item["gold_completion"],
-                add_special_tokens=False,
-                truncation=True,
-                max_length=639,
-            )["input_ids"] + [eos_id]
-            gold_pad_len = ((len(gold_full) + c_align - 1) // c_align) * c_align
-            gold_ids = torch.tensor(
-                [gold_full + [eos_id] * (gold_pad_len - len(gold_full))],
-                dtype=torch.long,
-                device=accelerator.device,
-            )
-            gold_mask = torch.zeros_like(gold_ids, dtype=torch.float32)
-            gold_mask[0, p_len : len(gold_full)] = 1.0
-
             with accelerator.accumulate(wrapper):
                 with torch.no_grad():
                     ref_h = ref_student.model(
@@ -768,65 +714,34 @@ def main():
                     ).last_hidden_state
 
                     rew_t = torch.tensor(rewards, dtype=torch.float32, device=accelerator.device)
-                    corr_t = torch.tensor(correct_flags, dtype=torch.float32, device=accelerator.device)
-
-                    # CRITICAL FIX: Only apply non-zero GRPO policy advantages when there is actual reward variance
-                    # (and for math, at least 1 rollout in the group must be verified correct, otherwise advantages=0
-                    # so we NEVER positively reinforce a wrong math answer!)
-                    if item["task_type"] == "math" and corr_t.sum().item() == 0:
-                        advantages = torch.zeros_like(rew_t)
-                        opd_weights = torch.zeros_like(rew_t)
-                    else:
-                        advantages = rew_t - rew_t.mean()
-                        # Only distill Teacher on verified correct rollouts (or above-average code rollouts)
-                        opd_weights = (advantages > 0.0).float()
+                    winner_mask = torch.tensor(correct_flags, dtype=torch.float32, device=accelerator.device)
+                    advantages = rew_t - rew_t.mean()
 
                 pol_h = wrapper(gen_seqs_aligned)
-                grpo_loss, opd_skew_loss, ref_kl = chunked_onpolicy_grpo_and_skew_kd(
-                    pol_h, ref_h, t_h, gen_seqs_aligned, resp_mask, advantages, opd_weights,
+                grpo_loss, opd_skew_loss, win_nll_loss, ref_kl = chunked_gold_injected_grpo_and_skew_kd(
+                    pol_h, ref_h, t_h, gen_seqs_aligned, resp_mask, advantages, winner_mask,
                     unwrapped_student.lm_head, ref_student.lm_head, teacher.lm_head,
-                    max_new_tokens=args.max_new_tokens, topk=args.topk_logits,
-                    skew_alpha=args.skew_alpha, beta_ref_kl=args.beta_ref_kl,
+                    topk=args.topk_logits, skew_alpha=args.skew_alpha, beta_ref_kl=args.beta_ref_kl,
                     chunk_size=args.logit_chunk_size,
                 )
-                loss_onpolicy = args.grpo_weight * grpo_loss + args.opd_skew_weight * opd_skew_loss
 
-                with accelerator.no_sync(wrapper):
-                    accelerator.backward(loss_onpolicy)
-
-                opd_val = opd_skew_loss.detach()
-                rkl_val = ref_kl.detach()
-                onpol_val = loss_onpolicy.detach()
-                del pol_h, ref_h, t_h, grpo_loss, opd_skew_loss, loss_onpolicy
-
-                # PASS B: Verified Gold CoT / Python Solution Anchor
-                # If all G rollouts failed on this problem, double the Gold CoT weight so the model learns the solution!
-                gold_mult = 1.5 if sum(correct_flags) == 0 else 0.75
-                with torch.no_grad():
-                    t_gold_h = t_backbone(
-                        input_ids=gold_ids, attention_mask=None, output_hidden_states=False, use_cache=False
-                    ).last_hidden_state
-
-                pol_gold_h = wrapper(gold_ids)
-                gold_loss, gold_ce = chunked_gold_cot_anchor(
-                    pol_gold_h, t_gold_h, gold_ids, gold_mask,
-                    unwrapped_student.lm_head, teacher.lm_head,
-                    topk=args.topk_logits, skew_alpha=args.skew_alpha, chunk_size=args.logit_chunk_size,
+                loss = (
+                    args.grpo_weight * grpo_loss
+                    + args.opd_skew_weight * opd_skew_loss
+                    + args.gold_cot_weight * win_nll_loss
                 )
-                loss_gold_scaled = (args.gold_cot_weight * gold_mult) * gold_loss
-                accelerator.backward(loss_gold_scaled)
 
-                total_step_loss = onpol_val + loss_gold_scaled.detach()
-                gce_val = gold_ce.detach()
-                del pol_gold_h, t_gold_h, gold_loss, loss_gold_scaled
+                accelerator.backward(loss)
 
-                running_sums[0] += total_step_loss.to(torch.float64)
-                running_sums[1] += rew_t.mean().to(torch.float64)
-                running_sums[2] += float(any(correct_flags))
-                running_sums[3] += opd_val.to(torch.float64)
-                running_sums[4] += gce_val.to(torch.float64)
-                running_sums[5] += rkl_val.to(torch.float64)
+                running_sums[0] += loss.detach().to(torch.float64)
+                running_sums[1] += float(onpolicy_mean_rew)
+                running_sums[2] += float(onpolicy_any_correct)
+                running_sums[3] += opd_skew_loss.detach().to(torch.float64)
+                running_sums[4] += win_nll_loss.detach().to(torch.float64)
+                running_sums[5] += ref_kl.detach().to(torch.float64)
                 running_cnt[0] += 1.0
+
+                del pol_h, ref_h, t_h
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(all_params, args.max_grad_norm)
@@ -850,8 +765,8 @@ def main():
                         lrs = scheduler.get_last_lr()
                         print(
                             f"[Stage 4C GRPO] Step {step:03d}/{args.max_steps} | Loss: {avg_l:.4f} | "
-                            f"Mean_Rew: {avg_rew:.3f} (Pass@{G}: {pass_at_g*100:.1f}%) | "
-                            f"Pos_OPD_RKL: {avg_opd:.4f} | Gold_CE: {avg_gce:.4f} | Ref_KL: {avg_rkl:.4f} | "
+                            f"OnPol_Rew: {avg_rew:.3f} (Pass@{G}: {pass_at_g*100:.1f}%) | "
+                            f"Win_SkewKD: {avg_opd:.4f} | Win_CE: {avg_gce:.4f} | Ref_KL: {avg_rkl:.4f} | "
                             f"LR: {lrs[0]:.2e} ({elapsed:.1f}s)"
                         )
 
