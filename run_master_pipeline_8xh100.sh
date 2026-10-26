@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # ==================================================================================================
-# MASTER END-TO-END BARETORCH HYBRIDIZATION & DISTILLATION ENGINE (8x NVIDIA H100 SXM5)
-# - Stages 0, 1, 2, 3, 4A (Full-Vocab KD & SFT) : Teacher = Qwen/Qwen3.5-2B (Native Subspace!)
-# - Stages 4B (DPO) & 4C (Dr. GRPO)             : Teacher = Qwen/Qwen3.5-4B (Top-64 Skew-KD!)
+# MASTER END-TO-END BARETORCH HYBRIDIZATION & UP-DISTILLATION ENGINE (8x NVIDIA H100 SXM5)
+# - Stage 0 + 0-Verify                          : Surgical Weight Transfer + 6-Point Verification
+# - Stages 1, 2, 3, 4A (Full-Vocab KD & SFT)    : Teacher = Qwen/Qwen3.5-2B (Native Subspace!)
+# - Stage 4B (DPO + Top-64 Skew-KD)             : Teacher = Qwen/Qwen3.5-4B -> Followed by lm_eval!
+# - Stage 4C (Reward-Filtered Dr. GRPO)         : Teacher = Qwen/Qwen3.5-4B -> Followed by GSM8K/MBPP!
 # ==================================================================================================
 set -euo pipefail
 
@@ -18,7 +20,7 @@ MODEL_TAG=${MODEL_TAG:-"2B_hybrid"}
 LRAD_CHUNK_SIZE=${LRAD_CHUNK_SIZE:-64}
 LRAD_RANK=${LRAD_RANK:-32}
 
-# High-speed storage root (set STORAGE_ROOT=/scratch on NVMe)
+# High-speed NVMe storage root (defaults to /scratch)
 STORAGE_ROOT=${STORAGE_ROOT:-"/scratch"}
 DATA_ROOT="${STORAGE_ROOT}/data"
 CKPT_ROOT="${STORAGE_ROOT}/checkpoints_${MODEL_TAG}"
@@ -27,6 +29,11 @@ LOG_DIR="${STORAGE_ROOT}/logs_${MODEL_TAG}"
 mkdir -p "${DATA_ROOT}" "${CKPT_ROOT}" "${LOG_DIR}"
 
 # H100 / NCCL / PyTorch Performance Environment Variables
+export HF_HOME="${STORAGE_ROOT}/hf_cache"
+export HF_DATASETS_CACHE="${STORAGE_ROOT}/hf_cache/datasets"
+export TMPDIR="${STORAGE_ROOT}/tmp"
+mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${TMPDIR}"
+
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export TOKENIZERS_PARALLELISM="false"
 export OMP_NUM_THREADS=8
@@ -61,7 +68,7 @@ echo "==========================================================================
 PIPELINE_START=$(date +%s)
 
 # --------------------------------------------------------------------------------------------------
-# STAGE 0: Surgical Hybrid Initialization (init_student_00.py)
+# STAGE 0: Surgical Hybrid Initialization (init_student_00.py) + 6-Point Verification (verify_init.py)
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE0}/pytorch_model.bin" ]; then
     echo -e "\n>>> [STAGE 0/7] Initializing BareTorch Hybrid Student from ${BASE_MODEL}..."
@@ -75,6 +82,19 @@ if [ ! -f "${CKPT_STAGE0}/pytorch_model.bin" ]; then
     echo ">>> [STAGE 0 DONE] Completed in $(($(date +%s) - T0))s."
 else
     echo ">>> [STAGE 0 SKIP] Found existing ${CKPT_STAGE0}/pytorch_model.bin"
+fi
+
+if [ ! -f "${LOG_DIR}/00a_verify_init.done" ]; then
+    echo -e "\n>>> [STAGE 0-VERIFY] Running 6-Point Surgical Initialization & Cache Verification..."
+    python verify_init.py \
+        --teacher_id "${BASE_MODEL}" \
+        --ckpt_dir "${CKPT_STAGE0}" \
+        --chunk_size "${LRAD_CHUNK_SIZE}" \
+        --rank "${LRAD_RANK}" \
+        2>&1 | tee "${LOG_DIR}/00a_verify_init.log"
+    touch "${LOG_DIR}/00a_verify_init.done"
+else
+    echo ">>> [STAGE 0-VERIFY SKIP] Already verified ${CKPT_STAGE0}"
 fi
 
 # --------------------------------------------------------------------------------------------------
@@ -180,12 +200,12 @@ else
 fi
 
 # --------------------------------------------------------------------------------------------------
-# STAGE 4A: 5-Pillar 8K Focal SFT with NATIVE BASE_MODEL Teacher (train_stage4a_updistill_sft_05.py)
+# STAGE 4A: 5-Pillar Focal SFT with NATIVE BASE_MODEL Teacher (train_stage4a_updistill_sft_05.py)
 # Uses BASE_MODEL (Qwen/Qwen3.5-2B) so full-vocab 248K KL stays 100% aligned with tied LM head!
-# 8 GPUs * 2 micro_batch * 1 accum * 2048 = 32,768 tokens/step * 8,000 steps = 262.1M tokens
+# 8 GPUs * 4 micro_batch * 1 accum * 2048 = 65,536 tokens/step * 4,000 steps = 262.1M tokens
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4A}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4A/7] Running 5-Pillar 8K Focal SFT with Native ${BASE_MODEL} Teacher..."
+    echo -e "\n>>> [STAGE 4A/7] Running 5-Pillar Focal SFT with Native ${BASE_MODEL} Teacher (65.5k tok/step)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage4a_updistill_sft_05.py \
         --teacher_id "${BASE_MODEL}" \
@@ -195,11 +215,11 @@ if [ ! -f "${CKPT_STAGE4A}/best/pytorch_model.bin" ]; then
         --sft_data_dir "${SFT_DATA_DIR}" \
         --cache_dir "${DATA_ROOT}/hf_cache_5pillar_8k_sft" \
         --output_dir "${CKPT_STAGE4A}" \
-        --lrad_lr 6.0e-5 \
-        --backbone_lr 1.2e-5 \
-        --micro_batch_size 2 \
+        --lrad_lr 8.0e-5 \
+        --backbone_lr 1.5e-5 \
+        --micro_batch_size 4 \
         --grad_accum_steps 1 \
-        --max_steps 8000 \
+        --max_steps 4000 \
         --logit_chunk_size 256 \
         --num_proc 32 \
         --num_workers 8 \
@@ -211,12 +231,11 @@ else
 fi
 
 # --------------------------------------------------------------------------------------------------
-# STAGE 4B: 6-Pillar Contrastive DPO + DistiLLM-2 Top-64 Skew-KD (train_stage4b_dpo_align_06.py)
-# Safely introduces POST_TEACHER (Qwen/Qwen3.5-4B) via Top-64 Skew-KD + 35% DPO Margin Blend!
-# 8 GPUs * 2 micro_batch * 1 accum = 16 pairs/step * 2,500 steps = 40,000 contrastive pairs
+# STAGE 4B: 6-Pillar Contrastive DPO + DistiLLM-2 Top-64 Skew-KD from POST_TEACHER (4B)
+# 8 GPUs * 4 micro_batch * 1 accum = 32 pairs/step * 1,250 steps = 40,000 contrastive pairs
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4B}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4B/7] Running 6-Pillar Contrastive DPO + Top-64 Skew-KD from ${POST_TEACHER} (2,500 steps)..."
+    echo -e "\n>>> [STAGE 4B/7] Running 6-Pillar Contrastive DPO + Top-64 Skew-KD from ${POST_TEACHER} (32 pairs/step)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage4b_dpo_align_06.py \
         --teacher_id "${POST_TEACHER}" \
@@ -225,11 +244,13 @@ if [ ! -f "${CKPT_STAGE4B}/best/pytorch_model.bin" ]; then
         --dpo_data_dir "${DPO_DATA_DIR}" \
         --cache_dir "${DATA_ROOT}/hf_cache_stage4b_6pillar_dpo" \
         --output_dir "${CKPT_STAGE4B}" \
-        --lrad_lr 1.5e-5 \
-        --backbone_lr 4.0e-6 \
-        --micro_batch_size 2 \
+        --lrad_lr 2.0e-5 \
+        --backbone_lr 5.0e-6 \
+        --micro_batch_size 4 \
         --grad_accum_steps 1 \
-        --max_steps 2500 \
+        --max_steps 1250 \
+        --eval_steps 125 \
+        --save_steps 250 \
         --logit_chunk_size 256 \
         --num_proc 32 \
         --num_workers 8 \
@@ -241,37 +262,12 @@ else
 fi
 
 # --------------------------------------------------------------------------------------------------
-# STAGE 4C: Bridged Dr. GRPO + On-Policy Top-64 Skew-KD for Math & Code (train_stage4c_grpo_math_code_07.py)
-# 8 GPUs * 1 accum * G=6 rollouts = 48 rollouts/step * 300 steps = 14,400 on-policy verifiable rollouts!
+# POST-STAGE 4B BENCHMARKS:
+# 1. Full 10-Task Non-Generative lm_eval Benchmark Suite (Stage 4B vs. Base Teacher)
+# 2. Pre-GRPO Generative Baseline (GSM8K + MBPP) for Teacher & Stage 4B Student
 # --------------------------------------------------------------------------------------------------
-if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4C/7] Running Bridged Dr. GRPO + On-Policy ${POST_TEACHER} Top-64 Skew-KD (Math & Code)..."
-    T0=$(date +%s)
-    ${ACCEL_CMD} train_stage4c_grpo_math_code_07.py \
-        --teacher_id "${POST_TEACHER}" \
-        --student_base_id "${BASE_MODEL}" \
-        --input_ckpt_dir "${CKPT_STAGE4B}/best" \
-        --output_dir "${CKPT_STAGE4C}" \
-        --group_size 6 \
-        --grad_accum_steps 1 \
-        --lrad_lr 1.0e-5 \
-        --backbone_lr 3.0e-6 \
-        --max_steps 300 \
-        --logit_chunk_size 128 \
-        --eval_steps 50 \
-        --save_steps 100 \
-        --no_grad_checkpointing \
-        2>&1 | tee "${LOG_DIR}/04c_stage4c_grpo_math_code_4B.log"
-    echo ">>> [STAGE 4C DONE] Completed in $(($(date +%s) - T0))s."
-else
-    echo ">>> [STAGE 4C SKIP] Found existing ${CKPT_STAGE4C}/best/pytorch_model.bin"
-fi
-
-# --------------------------------------------------------------------------------------------------
-# FINAL EVALUATION SUITE: 10-Task Core Benchmark + Generative Math (GSM8K) & Code (MBPP)
-# --------------------------------------------------------------------------------------------------
-echo -e "\n>>> [EVAL 1/2] Running 10-Task lm_eval Suite (Stage 4B vs. ${BASE_MODEL})..."
-if [ -f "run_lm_eval_benchmarks_04.py" ]; then
+if [ ! -f "${LOG_DIR}/lm_eval_stage4b_${MODEL_TAG}.json" ] && [ -f "run_lm_eval_benchmarks_04.py" ]; then
+    echo -e "\n>>> [EVAL STAGE 4B - 1/2] Running 10-Task Non-Generative lm_eval Suite (Stage 4B vs. ${BASE_MODEL})..."
     python run_lm_eval_benchmarks_04.py \
         --teacher_id "${BASE_MODEL}" \
         --student_ckpt "${CKPT_STAGE4B}/best" \
@@ -280,11 +276,55 @@ if [ -f "run_lm_eval_benchmarks_04.py" ]; then
         --batch_size 32 \
         --device cuda:0 \
         --output_json "${LOG_DIR}/lm_eval_stage4b_${MODEL_TAG}.json" \
-        2>&1 | tee "${LOG_DIR}/05_eval_lm_eval_stage4b.log"
+        2>&1 | tee "${LOG_DIR}/05a_eval_lm_eval_stage4b.log"
 fi
 
-echo -e "\n>>> [EVAL 2/2] Running Multi-GPU Generative Math (GSM8K) & Code (MBPP) Suite..."
+if [ ! -f "${LOG_DIR}/generative_eval_stage4b_baseline_${MODEL_TAG}.json" ] && [ -f "run_generative_benchmarks_08.py" ]; then
+    echo -e "\n>>> [EVAL STAGE 4B - 2/2] Running Pre-GRPO Generative Baseline (GSM8K & MBPP: ${BASE_MODEL} vs. Stage 4B)..."
+    ${ACCEL_CMD} run_generative_benchmarks_08.py \
+        --teacher_id "${BASE_MODEL}" \
+        --student_base_id "${BASE_MODEL}" \
+        --student_ckpt "${CKPT_STAGE4B}/best" \
+        --batch_size 32 \
+        --max_new_tokens 256 \
+        --max_samples 500 \
+        --output_json "${LOG_DIR}/generative_eval_stage4b_baseline_${MODEL_TAG}.json" \
+        2>&1 | tee "${LOG_DIR}/05b_eval_generative_stage4b_baseline.log"
+fi
+
+# --------------------------------------------------------------------------------------------------
+# STAGE 4C: Reward-Filtered Dr. GRPO + On-Policy Top-64 Skew-KD from POST_TEACHER (4B)
+# 8 GPUs * 1 accum * G=8 rollouts = 64 rollouts/step * 250 steps = 16,000 verifiable on-policy rollouts!
+# --------------------------------------------------------------------------------------------------
+if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
+    echo -e "\n>>> [STAGE 4C/7] Running Reward-Filtered Dr. GRPO + On-Policy ${POST_TEACHER} Top-64 Skew-KD (G=8)..."
+    T0=$(date +%s)
+    ${ACCEL_CMD} train_stage4c_grpo_math_code_07.py \
+        --teacher_id "${POST_TEACHER}" \
+        --student_base_id "${BASE_MODEL}" \
+        --input_ckpt_dir "${CKPT_STAGE4B}/best" \
+        --output_dir "${CKPT_STAGE4C}" \
+        --group_size 8 \
+        --grad_accum_steps 1 \
+        --lrad_lr 8.0e-6 \
+        --backbone_lr 2.5e-6 \
+        --max_steps 250 \
+        --logit_chunk_size 128 \
+        --eval_steps 50 \
+        --save_steps 50 \
+        --no_grad_checkpointing \
+        2>&1 | tee "${LOG_DIR}/04c_stage4c_grpo_math_code_4B.log"
+    echo ">>> [STAGE 4C DONE] Completed in $(($(date +%s) - T0))s."
+else
+    echo ">>> [STAGE 4C SKIP] Found existing ${CKPT_STAGE4C}/best/pytorch_model.bin"
+fi
+
+# --------------------------------------------------------------------------------------------------
+# POST-STAGE 4C BENCHMARKS:
+# Generative Math (GSM8K) & Code (MBPP) Evaluation (--skip_teacher since Teacher was already scored in 05b!)
+# --------------------------------------------------------------------------------------------------
 if [ -f "run_generative_benchmarks_08.py" ]; then
+    echo -e "\n>>> [EVAL STAGE 4C] Running Post-GRPO Multi-GPU Generative Math (GSM8K) & Code (MBPP) Suite..."
     ${ACCEL_CMD} run_generative_benchmarks_08.py \
         --teacher_id "${BASE_MODEL}" \
         --student_base_id "${BASE_MODEL}" \
@@ -292,6 +332,7 @@ if [ -f "run_generative_benchmarks_08.py" ]; then
         --batch_size 32 \
         --max_new_tokens 256 \
         --max_samples 500 \
+        --skip_teacher \
         --output_json "${LOG_DIR}/generative_eval_stage4c_${MODEL_TAG}.json" \
         2>&1 | tee "${LOG_DIR}/06_eval_generative_stage4c.log"
 fi
