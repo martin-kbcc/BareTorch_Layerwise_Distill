@@ -6,7 +6,7 @@
 # - Stage 3B (32K Long-Context Horizon Extension): Teacher = Qwen/Qwen3.5-2B (512-Chunk Calibration!)
 # - Stage 4A (5-Pillar Focal SFT & KD)           : Teacher = Qwen/Qwen3.5-2B (Native Subspace!)
 # - Stage 4B (DPO + Top-64 Skew-KD)              : Teacher = Qwen/Qwen3.5-4B -> Followed by lm_eval & 5-Task Gen!
-# - Stage 4C (4-Pillar <think> Dr. GRPO + KD)    : Teacher = Qwen/Qwen3.5-4B -> Followed by 5-Task Gen Suite!
+# - Stage 4C (4-Pillar <think> Dr. GRPO + KD)    : Teacher = Qwen/Qwen3.5-4B (1500 Steps, G=12) -> Gen & lm_eval!
 # ==================================================================================================
 set -euo pipefail
 
@@ -50,7 +50,7 @@ CKPT_STAGE3="${CKPT_ROOT}/stage3_final_distilled"
 CKPT_STAGE3B="${CKPT_ROOT}/stage3b_long_context_32k"
 CKPT_STAGE4A="${CKPT_ROOT}/stage4a_5pillar_8k_2B"
 CKPT_STAGE4B="${CKPT_ROOT}/stage4b_6pillar_dpo_4B"
-CKPT_STAGE4C="${CKPT_ROOT}/stage4c_grpo_math_code_4B"
+CKPT_STAGE4C="${CKPT_ROOT}/stage4c_grpo_math_code_1500steps_4B"
 
 # Dataset Paths
 PRETRAIN_DATA_DIR="${DATA_ROOT}/fineweb_edu_packed_2048"
@@ -329,33 +329,33 @@ fi
 
 # --------------------------------------------------------------------------------------------------
 # STAGE 4C: 4-Pillar <think>-Guided Dr. GRPO + Winner-Only Top-64 Skew-KD from POST_TEACHER (4B)
-# 8 GPUs * 1 accum * G=8 rollouts = 64 rollouts/step * 250 steps = 16,000 verifiable on-policy rollouts!
+# 8 GPUs * 1 accum * G=12 rollouts = 96 rollouts/step * 1,500 steps = 144,000 verifiable on-policy rollouts!
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4C/8] Running 4-Pillar <think>-Guided Dr. GRPO + Winner-Only ${POST_TEACHER} Top-64 Skew-KD (G=8)..."
+    echo -e "\n>>> [STAGE 4C/8] Running 1500-Step 4-Pillar <think>-Guided Dr. GRPO + ${POST_TEACHER} Top-64 Skew-KD (G=12)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage4c_grpo_math_code_07.py \
         --teacher_id "${POST_TEACHER}" \
         --student_base_id "${BASE_MODEL}" \
         --input_ckpt_dir "${CKPT_STAGE4B}/best" \
         --output_dir "${CKPT_STAGE4C}" \
-        --group_size 8 \
+        --group_size 12 \
         --max_prompt_len 384 \
         --max_new_tokens 320 \
         --grad_accum_steps 1 \
-        --lrad_lr 2.0e-5 \
-        --backbone_lr 5.0e-6 \
+        --lrad_lr 1.2e-5 \
+        --backbone_lr 3.0e-6 \
         --grpo_weight 0.40 \
         --opd_skew_weight 0.40 \
         --gold_cot_weight 0.20 \
-        --beta_ref_kl 0.04 \
-        --max_steps 250 \
-        --logit_chunk_size 128 \
-        --eval_steps 50 \
-        --eval_prompts 60 \
-        --save_steps 50 \
+        --beta_ref_kl 0.05 \
+        --max_steps 1500 \
+        --logit_chunk_size 64 \
+        --eval_steps 100 \
+        --eval_prompts 100 \
+        --save_steps 100 \
         --no_grad_checkpointing \
-        2>&1 | tee "${LOG_DIR}/04c_stage4c_grpo_math_code_4B.log"
+        2>&1 | tee "${LOG_DIR}/04c_stage4c_grpo_math_code_1500steps_4B.log"
     echo ">>> [STAGE 4C DONE] Completed in $(($(date +%s) - T0))s."
 else
     echo ">>> [STAGE 4C SKIP] Found existing ${CKPT_STAGE4C}/best/pytorch_model.bin"
@@ -363,11 +363,11 @@ fi
 
 # --------------------------------------------------------------------------------------------------
 # POST-STAGE 4C BENCHMARKS:
-# 5-Task Generative Evaluation (GSM8K, MATH-500, GPQA, MBPP, HumanEval)
-# Uses --skip_teacher and --teacher_baseline_json to auto-load Teacher scores from 05b!
+# 1. 5-Task Generative Evaluation (GSM8K, MATH-500, GPQA, MBPP, HumanEval)
+# 2. Final 10-Task Non-Generative lm_eval Verification on the Stage 4C Champion Checkpoint
 # --------------------------------------------------------------------------------------------------
 if [ -f "run_generative_benchmarks_08.py" ]; then
-    echo -e "\n>>> [EVAL STAGE 4C] Running Post-GRPO 5-Task Generative Suite (GSM8K, MATH-500, GPQA, MBPP, HumanEval)..."
+    echo -e "\n>>> [EVAL STAGE 4C - 1/2] Running Post-GRPO 5-Task Generative Suite (GSM8K, MATH-500, GPQA, MBPP, HumanEval)..."
     ${ACCEL_CMD} run_generative_benchmarks_08.py \
         --teacher_id "${BASE_MODEL}" \
         --student_base_id "${BASE_MODEL}" \
@@ -379,8 +379,21 @@ if [ -f "run_generative_benchmarks_08.py" ]; then
         --max_samples 500 \
         --skip_teacher \
         --teacher_baseline_json "${LOG_DIR}/generative_eval_stage4b_baseline_${MODEL_TAG}.json" \
-        --output_json "${LOG_DIR}/generative_eval_stage4c_${MODEL_TAG}.json" \
-        2>&1 | tee "${LOG_DIR}/06_eval_generative_stage4c.log"
+        --output_json "${LOG_DIR}/generative_eval_stage4c_1500steps_${MODEL_TAG}.json" \
+        2>&1 | tee "${LOG_DIR}/06a_eval_generative_stage4c_1500steps.log"
+fi
+
+if [ -f "run_lm_eval_benchmarks_04.py" ]; then
+    echo -e "\n>>> [EVAL STAGE 4C - 2/2] Running Final 10-Task Non-Generative lm_eval Suite (Stage 4C vs. ${BASE_MODEL})..."
+    python run_lm_eval_benchmarks_04.py \
+        --teacher_id "${BASE_MODEL}" \
+        --student_ckpt "${CKPT_STAGE4C}/best" \
+        --tasks arc_easy,arc_challenge,piqa,winogrande,hellaswag,boolq,openbookqa,sciq,lambada_openai,mmlu \
+        --num_fewshot 0 \
+        --batch_size 32 \
+        --device cuda:0 \
+        --output_json "${LOG_DIR}/lm_eval_stage4c_1500steps_${MODEL_TAG}.json" \
+        2>&1 | tee "${LOG_DIR}/06b_eval_lm_eval_stage4c_1500steps.log"
 fi
 
 TOTAL_ELAPSED=$(($(date +%s) - PIPELINE_START))
@@ -389,6 +402,6 @@ echo " ALL BARETORCH PIPELINE STAGES COMPLETED SUCCESSFULLY IN $((TOTAL_ELAPSED 
 echo "  - Stage 3B 32K Long-Context      : ${CKPT_STAGE3B}/best"
 echo "  - Stage 4A SFT (2B Teacher)      : ${CKPT_STAGE4A}/best"
 echo "  - Stage 4B DPO (4B Skew-KD)      : ${CKPT_STAGE4B}/best"
-echo "  - Stage 4C GRPO (4B OnPolicy-KD) : ${CKPT_STAGE4C}/best"
+echo "  - Stage 4C GRPO (1500 Steps, G12): ${CKPT_STAGE4C}/best"
 echo "  - Full Reports                   : ${LOG_DIR}/"
 echo "=================================================================================================="
