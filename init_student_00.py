@@ -4,6 +4,7 @@ import copy
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from baretorch import BareTorchConfig, BareTorchForCausalLM
@@ -51,17 +52,31 @@ def copy_qwen_rmsnorm_to_baretorch(bt_rmsnorm: nn.Module, qwen_rmsnorm: nn.Modul
 
 
 def downsample_rows(weight: torch.Tensor, target_rows: int) -> torch.Tensor:
-    if weight.shape[0] == target_rows:
+    src_rows, cols = weight.shape
+    if src_rows == target_rows:
         return weight
-    ratio = weight.shape[0] // target_rows
-    return (weight.float().view(target_rows, ratio, weight.shape[1]).mean(dim=1) * (ratio ** 0.5)).to(weight.dtype)
+    scale = (src_rows / float(target_rows)) ** 0.5
+    if src_rows > target_rows and src_rows % target_rows == 0:
+        ratio = src_rows // target_rows
+        return (weight.float().view(target_rows, ratio, cols).mean(dim=1) * scale).to(weight.dtype)
+    # General arbitrary-dimension row projection (handles 2048 -> 2560 and 4096 -> 2560 in Qwen3.5-4B/9B)
+    w_t = weight.float().transpose(0, 1).unsqueeze(0)  # [1, cols, src_rows]
+    w_resized = F.interpolate(w_t, size=target_rows, mode="linear", align_corners=False)
+    return (w_resized.squeeze(0).transpose(0, 1).contiguous() * scale).to(weight.dtype)
 
 
 def downsample_cols(weight: torch.Tensor, target_cols: int) -> torch.Tensor:
-    if weight.shape[1] == target_cols:
+    rows, src_cols = weight.shape
+    if src_cols == target_cols:
         return weight
-    ratio = weight.shape[1] // target_cols
-    return (weight.float().view(weight.shape[0], target_cols, ratio).mean(dim=2) * (ratio ** 0.5)).to(weight.dtype)
+    scale = (src_cols / float(target_cols)) ** 0.5
+    if src_cols > target_cols and src_cols % target_cols == 0:
+        ratio = src_cols // target_cols
+        return (weight.float().view(rows, target_cols, ratio).mean(dim=2) * scale).to(weight.dtype)
+    # General arbitrary-dimension column projection (handles 4096 -> 2560 in Qwen3.5-4B/9B)
+    w_t = weight.float().unsqueeze(0)  # [1, rows, src_cols]
+    w_resized = F.interpolate(w_t, size=target_cols, mode="linear", align_corners=False)
+    return (w_resized.squeeze(0).contiguous() * scale).to(weight.dtype)
 
 
 def warm_start_cs_lrad_from_qwen_deltanet(s_attn, t_mixer):
@@ -212,7 +227,7 @@ if __name__ == "__main__":
     parser.add_argument("--teacher_id", type=str, default="Qwen/Qwen3.5-0.8B", help="Base Teacher HF ID")
     parser.add_argument("--save_dir", type=str, default="./checkpoints/stage0_initialized", help="Output checkpoint dir")
     parser.add_argument("--chunk_size", type=int, default=64, help="CS-LRAD chunk size")
-    parser.add_argument("--rank", type=int, default=16, help="CS-LRAD low-rank state factor r (16 for 0.8B, 32 for 2B)")
+    parser.add_argument("--rank", type=int, default=16, help="CS-LRAD low-rank state factor r (16 for 0.8B, 32 for 2B/4B)")
     args = parser.parse_args()
 
     build_and_initialize_student(
