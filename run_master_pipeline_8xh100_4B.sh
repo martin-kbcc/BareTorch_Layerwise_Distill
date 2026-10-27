@@ -181,10 +181,11 @@ fi
 
 # --------------------------------------------------------------------------------------------------
 # STAGE 3: Full-Model Joint Knowledge Distillation (train_stage3_full_kd_03.py)
-# Teacher = Qwen/Qwen3.5-4B | 8 GPUs * 4 micro_batch * 1 accum * 2048 = 65,536 tokens/step * 3,500 steps
+# Teacher = Qwen/Qwen3.5-4B | 8 GPUs * 2 micro_batch * 2 accum * 2048 = 65,536 tokens/step * 3,500 steps
+# (micro_batch_size=2 + grad_accum_steps=2 keeps identical 65.5k tok/step while cutting activation VRAM by 50%!)
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE3}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 3/8] Running Full-Model Joint KD with Differential LRs (65.5k tok/step, grad_accum=1)..."
+    echo -e "\n>>> [STAGE 3/8] Running Full-Model Joint KD with Differential LRs (65.5k tok/step, micro=2, accum=2)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage3_full_kd_03.py \
         --teacher_id "${BASE_MODEL}" \
@@ -193,10 +194,10 @@ if [ ! -f "${CKPT_STAGE3}/best/pytorch_model.bin" ]; then
         --output_dir "${CKPT_STAGE3}" \
         --lrad_lr 1.2e-4 \
         --backbone_lr 1.2e-5 \
-        --micro_batch_size 4 \
-        --grad_accum_steps 1 \
+        --micro_batch_size 2 \
+        --grad_accum_steps 2 \
         --max_steps 3500 \
-        --logit_chunk_size 256 \
+        --logit_chunk_size 128 \
         --log_steps 25 \
         --eval_steps 250 \
         --save_steps 500 \
@@ -211,7 +212,7 @@ fi
 # --------------------------------------------------------------------------------------------------
 # STAGE 3B: Long-Context (32768-Token / 512-Chunk) Horizon Extension (train_stage3b_long_context_03b.py)
 # Teacher = Qwen/Qwen3.5-4B | 8 GPUs * 1 micro_batch * 1 accum * 32768 = 262,144 tokens/step * 500 steps
-# Note: Gradient checkpointing stays ENABLED here (no --no_grad_checkpointing flag) so 32K fits in 80GB!
+# Note: Gradient checkpointing stays ENABLED here (no --no_grad_checkpointing flag) + logit_chunk_size=128!
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE3B}/best/pytorch_model.bin" ]; then
     echo -e "\n>>> [STAGE 3B/8] Running 32768-Token (512-Chunk) Long-Context Horizon Extension..."
@@ -228,7 +229,7 @@ if [ ! -f "${CKPT_STAGE3B}/best/pytorch_model.bin" ]; then
         --micro_batch_size 1 \
         --grad_accum_steps 1 \
         --max_steps 500 \
-        --logit_chunk_size 256 \
+        --logit_chunk_size 128 \
         --log_steps 10 \
         --eval_steps 100 \
         --save_steps 100 \
@@ -242,10 +243,10 @@ fi
 # --------------------------------------------------------------------------------------------------
 # STAGE 4A: 5-Pillar Focal SFT with NATIVE BASE_MODEL Teacher (train_stage4a_updistill_sft_05.py)
 # Uses BASE_MODEL (Qwen/Qwen3.5-4B) so full-vocab 248K KL stays 100% aligned with tied LM head!
-# 8 GPUs * 4 micro_batch * 1 accum * 2048 = 65,536 tokens/step * 4,000 steps = 262.1M tokens
+# 8 GPUs * 2 micro_batch * 2 accum * 2048 = 65,536 tokens/step * 4,000 steps = 262.1M tokens
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4A}/best/pytorch_model.bin" ]; then
-    echo -e "\n>>> [STAGE 4A/8] Running 5-Pillar Focal SFT with Native ${BASE_MODEL} Teacher (65.5k tok/step)..."
+    echo -e "\n>>> [STAGE 4A/8] Running 5-Pillar Focal SFT with Native ${BASE_MODEL} Teacher (65.5k tok/step, micro=2, accum=2)..."
     T0=$(date +%s)
     ${ACCEL_CMD} train_stage4a_updistill_sft_05.py \
         --teacher_id "${BASE_MODEL}" \
@@ -257,10 +258,10 @@ if [ ! -f "${CKPT_STAGE4A}/best/pytorch_model.bin" ]; then
         --output_dir "${CKPT_STAGE4A}" \
         --lrad_lr 6.0e-5 \
         --backbone_lr 1.2e-5 \
-        --micro_batch_size 4 \
-        --grad_accum_steps 1 \
+        --micro_batch_size 2 \
+        --grad_accum_steps 2 \
         --max_steps 4000 \
-        --logit_chunk_size 256 \
+        --logit_chunk_size 128 \
         --num_proc 32 \
         --num_workers 8 \
         --no_grad_checkpointing \
@@ -273,7 +274,7 @@ fi
 # --------------------------------------------------------------------------------------------------
 # STAGE 4B: 6-Pillar Contrastive DPO + DistiLLM-2 Top-64 Skew-KD from POST_TEACHER (Qwen/Qwen3.5-9B)
 # Memory Footprint on 80GB H100: 9B Teacher (~18GB) + 4B Ref (~8GB) + 4B Student+Opt (~24GB) = ~50GB Static
-# 8 GPUs * 2 micro_batch * 2 accum = 32 pairs/step * 1,250 steps = 40,000 contrastive pairs!
+# 8 GPUs * 1 micro_batch * 4 accum = 32 pairs/step * 1,250 steps = 40,000 contrastive pairs!
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4B}/best/pytorch_model.bin" ]; then
     echo -e "\n>>> [STAGE 4B/8] Running 6-Pillar Contrastive DPO + Top-64 Skew-KD from ${POST_TEACHER} (32 pairs/step)..."
@@ -287,15 +288,14 @@ if [ ! -f "${CKPT_STAGE4B}/best/pytorch_model.bin" ]; then
         --output_dir "${CKPT_STAGE4B}" \
         --lrad_lr 1.5e-5 \
         --backbone_lr 4.0e-6 \
-        --micro_batch_size 2 \
-        --grad_accum_steps 2 \
+        --micro_batch_size 1 \
+        --grad_accum_steps 4 \
         --max_steps 1250 \
         --eval_steps 125 \
         --save_steps 250 \
         --logit_chunk_size 128 \
         --num_proc 32 \
         --num_workers 8 \
-        --no_grad_checkpointing \
         2>&1 | tee "${LOG_DIR}/04b_stage4b_dpo_align_9B.log"
     echo ">>> [STAGE 4B DONE] Completed in $(($(date +%s) - T0))s."
 else
@@ -338,6 +338,7 @@ fi
 # --------------------------------------------------------------------------------------------------
 # STAGE 4C: 4-Pillar <think>-Guided Dr. GRPO + Winner-Only Top-64 Skew-KD from POST_TEACHER (Qwen/Qwen3.5-9B)
 # 8 GPUs * 1 accum * G=12 rollouts = 96 rollouts/step * 1,500 steps = 144,000 verifiable on-policy rollouts!
+# (Gradient checkpointing enabled on 4B Student so 9B Teacher + 4B Ref + G=12 rollouts fit cleanly in 80GB)
 # --------------------------------------------------------------------------------------------------
 if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
     echo -e "\n>>> [STAGE 4C/8] Running 1500-Step 4-Pillar <think>-Guided Dr. GRPO + ${POST_TEACHER} Top-64 Skew-KD (G=12)..."
@@ -362,7 +363,6 @@ if [ ! -f "${CKPT_STAGE4C}/best/pytorch_model.bin" ]; then
         --eval_steps 100 \
         --eval_prompts 100 \
         --save_steps 100 \
-        --no_grad_checkpointing \
         2>&1 | tee "${LOG_DIR}/04c_stage4c_grpo_math_code_1500steps_9B.log"
     echo ">>> [STAGE 4C DONE] Completed in $(($(date +%s) - T0))s."
 else
