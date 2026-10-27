@@ -1,8 +1,9 @@
 # Data directories
 data*/
 data*
-
 checkpoints*
+hf_export_baretorch*
+logs*
 
 # Lowercase qwen directories and files (checkpoints, caches, features)
 qwen*

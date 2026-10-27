@@ -1,0 +1,195 @@
+{
+  "device": "NVIDIA GeForce RTX 4090",
+  "gen_tokens": 64,
+  "context_lengths": [
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768
+  ],
+  "scales": {
+    "Qwen3.5-2B": {
+      "bt_label": "BareTorch-Qwen3.5-2B (r=32, Compiled)",
+      "qw_label": "Qwen3.5-2B (Native)",
+      "bt_params_m": 1899.7,
+      "qw_params_m": 1881.8,
+      "bt_weights_gb": 3.546,
+      "qw_weights_gb": 3.513,
+      "baretorch": {
+        "512": {
+          "context_len": 512,
+          "ttft_ms": 24.418752670288086,
+          "prefill_tok_s": 20967.491948226507,
+          "decode_ms": 1343.824951171875,
+          "decode_tok_s": 47.625250553793606,
+          "kv_cache_mb": 11.25,
+          "base_weights_gb": 3.546353340148926,
+          "peak_vram_gb": 3.647092342376709,
+          "dynamic_overhead_gb": 0.1007390022277832,
+          "params_m": 1899.7
+        },
+        "1024": {
+          "context_len": 1024,
+          "ttft_ms": 31.39414405822754,
+          "prefill_tok_s": 32617.547976487604,
+          "decode_ms": 1335.394287109375,
+          "decode_tok_s": 47.925920170390924,
+          "kv_cache_mb": 17.25,
+          "base_weights_gb": 3.546353340148926,
+          "peak_vram_gb": 3.6232805252075195,
+          "dynamic_overhead_gb": 0.07692718505859375,
+          "params_m": 1899.7
+        },
+        "2048": {
+          "context_len": 2048,
+          "ttft_ms": 61.61759948730469,
+          "prefill_tok_s": 33237.257164196366,
+          "decode_ms": 1360.6666259765625,
+          "decode_tok_s": 47.035768187572494,
+          "kv_cache_mb": 29.25,
+          "base_weights_gb": 3.546353340148926,
+          "peak_vram_gb": 3.6958131790161133,
+          "dynamic_overhead_gb": 0.1494598388671875,
+          "params_m": 1899.7
+        },
+        "4096": {
+          "context_len": 4096,
+          "ttft_ms": 119.87590026855469,
+          "prefill_tok_s": 34168.66935575745,
+          "decode_ms": 1338.25537109375,
+          "decode_tok_s": 47.823458349128906,
+          "kv_cache_mb": 53.25,
+          "base_weights_gb": 3.546353340148926,
+          "peak_vram_gb": 3.840878486633301,
+          "dynamic_overhead_gb": 0.294525146484375,
+          "params_m": 1899.7
+        },
+        "8192": {
+          "context_len": 8192,
+          "ttft_ms": 253.2838134765625,
+          "prefill_tok_s": 32343.16432446657,
+          "decode_ms": 1340.7191162109375,
+          "decode_tok_s": 47.735576547064596,
+          "kv_cache_mb": 101.25,
+          "base_weights_gb": 3.546353340148926,
+          "peak_vram_gb": 4.131009101867676,
+          "dynamic_overhead_gb": 0.58465576171875,
+          "params_m": 1899.7
+        },
+        "16384": {
+          "context_len": 16384,
+          "ttft_ms": 534.1741943359375,
+          "prefill_tok_s": 30671.64264714788,
+          "decode_ms": 1329.3558349609375,
+          "decode_tok_s": 48.14361837278926,
+          "kv_cache_mb": 197.25,
+          "base_weights_gb": 3.546353340148926,
+          "peak_vram_gb": 4.711270332336426,
+          "dynamic_overhead_gb": 1.1649169921875,
+          "params_m": 1899.7
+        },
+        "32768": {
+          "context_len": 32768,
+          "ttft_ms": 1191.8665771484375,
+          "prefill_tok_s": 27493.010231395223,
+          "decode_ms": 1367.7916259765625,
+          "decode_tok_s": 46.79075290748757,
+          "kv_cache_mb": 389.25,
+          "base_weights_gb": 3.546353340148926,
+          "peak_vram_gb": 5.871792793273926,
+          "dynamic_overhead_gb": 2.325439453125,
+          "params_m": 1899.7
+        }
+      },
+      "qwen": {
+        "512": {
+          "context_len": 512,
+          "ttft_ms": 39.91551971435547,
+          "prefill_tok_s": 12827.090907596554,
+          "decode_ms": 1438.9002685546875,
+          "decode_tok_s": 44.478412714652706,
+          "kv_cache_mb": 25.59375,
+          "base_weights_gb": 3.5131282806396484,
+          "peak_vram_gb": 3.5728893280029297,
+          "dynamic_overhead_gb": 0.05976104736328125,
+          "params_m": 1881.8
+        },
+        "1024": {
+          "context_len": 1024,
+          "ttft_ms": 39.834625244140625,
+          "prefill_tok_s": 25706.27924133974,
+          "decode_ms": 1428.1861572265625,
+          "decode_tok_s": 44.81208536867737,
+          "kv_cache_mb": 31.59375,
+          "base_weights_gb": 3.5131282806396484,
+          "peak_vram_gb": 3.6142024993896484,
+          "dynamic_overhead_gb": 0.10107421875,
+          "params_m": 1881.8
+        },
+        "2048": {
+          "context_len": 2048,
+          "ttft_ms": 61.74924850463867,
+          "prefill_tok_s": 33166.39553671899,
+          "decode_ms": 1432.890380859375,
+          "decode_tok_s": 44.6649659003336,
+          "kv_cache_mb": 43.59375,
+          "base_weights_gb": 3.5131282806396484,
+          "peak_vram_gb": 3.696828842163086,
+          "dynamic_overhead_gb": 0.1837005615234375,
+          "params_m": 1881.8
+        },
+        "4096": {
+          "context_len": 4096,
+          "ttft_ms": 123.14009857177734,
+          "prefill_tok_s": 33262.926110234315,
+          "decode_ms": 1405.941650390625,
+          "decode_tok_s": 45.52109255901077,
+          "kv_cache_mb": 67.59375,
+          "base_weights_gb": 3.5131282806396484,
+          "peak_vram_gb": 3.862081527709961,
+          "dynamic_overhead_gb": 0.3489532470703125,
+          "params_m": 1881.8
+        },
+        "8192": {
+          "context_len": 8192,
+          "ttft_ms": 271.2719421386719,
+          "prefill_tok_s": 30198.47882318887,
+          "decode_ms": 1402.5615234375,
+          "decode_tok_s": 45.63079688878398,
+          "kv_cache_mb": 115.59375,
+          "base_weights_gb": 3.5131282806396484,
+          "peak_vram_gb": 4.192586898803711,
+          "dynamic_overhead_gb": 0.6794586181640625,
+          "params_m": 1881.8
+        },
+        "16384": {
+          "context_len": 16384,
+          "ttft_ms": 576.9943237304688,
+          "prefill_tok_s": 28395.426655277555,
+          "decode_ms": 1447.319580078125,
+          "decode_tok_s": 44.21967399663407,
+          "kv_cache_mb": 211.59375,
+          "base_weights_gb": 3.5131282806396484,
+          "peak_vram_gb": 4.853597640991211,
+          "dynamic_overhead_gb": 1.3404693603515625,
+          "params_m": 1881.8
+        },
+        "32768": {
+          "context_len": 32768,
+          "ttft_ms": 1262.6319580078125,
+          "prefill_tok_s": 25952.138936592044,
+          "decode_ms": 1413.316650390625,
+          "decode_tok_s": 45.283553393580355,
+          "kv_cache_mb": 403.59375,
+          "base_weights_gb": 3.5131282806396484,
+          "peak_vram_gb": 6.175619125366211,
+          "dynamic_overhead_gb": 2.6624908447265625,
+          "params_m": 1881.8
+        }
+      }
+    }
+  }
+}
