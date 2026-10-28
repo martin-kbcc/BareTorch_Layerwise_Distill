@@ -208,8 +208,11 @@ from .transformer import (
     unwrap_kv_pair,
 )
 
-# Disable PyTorch cuDNN SDPA backend bug for head_dim=256 in bfloat16 (routes to Flash/Mem-Efficient SDPA)
+# Enable TF32 Tensor Cores & disable PyTorch cuDNN SDPA backend bug for head_dim=256 in bfloat16
 if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
     torch.backends.cuda.enable_cudnn_sdp(False)
 
 
@@ -217,7 +220,7 @@ def _build_qwen3_5_full_attn_components(config: BareTorchConfig):
     """
     Constructs a local `Qwen3_5TextConfig`, `Qwen3_5DecoderLayer` class, and rotary embedding
     module directly from `config.qwen_text_config_dict` so `BareTorchModel.__init__` builds
-    the exact 6 full-attention layers (`model.layers.{3, 7, 11, 15, 19, 23}`) with 0 missing
+    the exact full-attention layers (`model.layers.{3, 7, 11, ...}`) with 0 missing
     or unexpected keys and 0 external Hub downloads.
     """
     q_dict = getattr(config, "qwen_text_config_dict", None)
@@ -543,7 +546,28 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         self._gradient_checkpointing_func = partial(checkpoint.checkpoint, use_reentrant=False)
         self.model = BareTorchModel(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self._is_cs_lrad_compiled = False
         self.post_init()
+
+    def compile_cs_lrad(self, mode: str = "default", dynamic: bool = True):
+        """
+        Compiles all CS-LRAD recurrent blocks (`chunk_forward`, `ln1`, `ln2`, `mlp`) using
+        `torch.compile(..., dynamic=True)` so arbitrary prompt lengths and batch sizes run at
+        peak fused Triton/Inductor speed without shape-recompilation stalls or cache graph breaks.
+        """
+        if getattr(self, "_is_cs_lrad_compiled", False):
+            return self
+        compiled_count = 0
+        for layer in self.model.layers:
+            if isinstance(layer, LRADDecoderBlock) or "lrad" in layer.__class__.__name__.lower():
+                layer.ln1.forward = torch.compile(layer.ln1.forward, mode=mode, dynamic=dynamic)
+                layer.attn.chunk_forward = torch.compile(layer.attn.chunk_forward, mode=mode, dynamic=dynamic)
+                layer.ln2.forward = torch.compile(layer.ln2.forward, mode=mode, dynamic=dynamic)
+                layer.mlp.forward = torch.compile(layer.mlp.forward, mode=mode, dynamic=dynamic)
+                compiled_count += 1
+        self.model.final_norm.forward = torch.compile(self.model.final_norm.forward, mode=mode, dynamic=dynamic)
+        self._is_cs_lrad_compiled = True
+        return self
 
     def get_input_embeddings(self):
         return self.model.token_embedding
@@ -697,9 +721,11 @@ def generate_model_card_markdown(
     hw_eval_data: Optional[Dict[str, Any]] = None,
 ) -> str:
     FENCE = "`" * 3
+    scale_tag = base_teacher_id.split("-")[-1]  # e.g. "0.8B", "2B", "4B"
     model_name = repo_id if repo_id else f"model-rampage/BareTorch-{base_teacher_id.split('/')[-1]}-Hybrid"
     num_lrad = sum(1 for x in bt_config.layer_types if x == "cs_lrad")
     num_full = sum(1 for x in bt_config.layer_types if x == "transformer")
+    static_vram_gb = (active_params_m * 2.0) / 1024.0
 
     lm_rows = [
         ("ARC-Challenge", "acc_norm", "41.38%", "53.84%", "+12.46%", "130.1%"),
@@ -730,7 +756,7 @@ def generate_model_card_markdown(
         if custom_rows:
             lm_rows = custom_rows
 
-    lm_table_md = "| Benchmark | Metric | Base Teacher (`Qwen3.5-2B`) | BareTorch Hybrid (`2B`) | Delta (S - T) | Retention |\n"
+    lm_table_md = f"| Benchmark | Metric | Base Teacher (`{base_teacher_id}`) | BareTorch Hybrid (`{scale_tag}`) | Delta (S - T) | Retention |\n"
     lm_table_md += "| :--- | :---: | :---: | :---: | :---: | :---: |\n"
     for r in lm_rows:
         lm_table_md += f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |\n"
@@ -772,7 +798,7 @@ def generate_model_card_markdown(
         if built_gen:
             gen_rows = built_gen
 
-    gen_table_md = "| Generative Benchmark | Metric | Base Teacher (`Qwen3.5-2B`) | BareTorch Hybrid (`2B`) | Delta (S - T) | Retention |\n"
+    gen_table_md = f"| Generative Benchmark | Metric | Base Teacher (`{base_teacher_id}`) | BareTorch Hybrid (`{scale_tag}`) | Delta (S - T) | Retention |\n"
     gen_table_md += "| :--- | :---: | :---: | :---: | :---: | :---: |\n"
     for r in gen_rows:
         gen_table_md += f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |\n"
@@ -796,36 +822,55 @@ def generate_model_card_markdown(
         "pipeline_tag: text-generation",
         "---",
         "",
-        f"# {model_name}",
+        '<div align="center">',
         "",
-        f"**{model_name}** is a high-efficiency **CS-LRAD (Chunked Selective Low-Rank Associative Delta)** hybrid language model distilled from `{base_teacher_id}` and up-distilled from `{updistill_teacher_id}` using the multi-stage BareTorch Up-Distillation Engine.",
+        "# 🐻🔥 Model Rampage",
+        f"### `{model_name}`",
         "",
-        f"By replacing 75% of the backbone's token mixers ({num_lrad} of {bt_config.num_layers} layers) with pure-PyTorch `torch.compile`-compatible low-rank (`r={bt_config.rank}`, `chunk_size={bt_config.chunk_size}`) associative recurrent blocks while preserving {num_full} interleaved Full-Attention anchor layers, **{model_name}** achieves:",
+        "**Building Hardware-Portable, Pure-GEMM Sub-Quadratic LLM Architectures for the Edge & Cloud**",
+        "",
+        "[![GitHub Engine](https://img.shields.io/badge/GitHub-BareTorch_Engine-black?logo=github)](https://github.com/martin-kbcc/baretorch)",
+        "[![Distillation Pipeline](https://img.shields.io/badge/GitHub-Layerwise_Distill_Pipeline-181717?logo=github)](https://github.com/martin-kbcc/BareTorch_Layerwise_Distill)",
+        "[![Paper PDF](https://img.shields.io/badge/Paper-PDF-red.svg)](https://github.com/martin-kbcc/baretorch-experiments/blob/main/paper.pdf)",
+        "[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://apache.org/licenses/LICENSE-2.0)",
+        "",
+        "</div>",
+        "",
+        "---",
+        "",
+        "## 🌟 Overview",
+        "",
+        f"**{model_name}** is a high-efficiency **CS-LRAD (Chunked Selective Low-Rank Associative Delta)** hybrid language model surgically distilled from `{base_teacher_id}` and up-distilled from `{updistill_teacher_id}` using the multi-stage [BareTorch Layerwise Up-Distillation Engine](https://github.com/martin-kbcc/BareTorch_Layerwise_Distill).",
+        "",
+        "While existing sub-quadratic architectures (such as Mamba-2, RWKV, and Gated DeltaNet) rely on hardware-locked C++/CUDA/Triton extensions (`causal-conv1d`, `flash-linear-attention`) that fail to port cleanly to systolic arrays and edge devices, **BareTorch** formulates sub-quadratic sequence mixing using **100% standard matrix multiplications (GEMMs)** and an exact **$O(1)$ low-rank recurrent associative state update** for decoding.",
+        "",
+        f"By replacing 75% of the backbone's token mixers ({num_lrad} of {bt_config.num_layers} layers) with pure-PyTorch `torch.compile`-compatible low-rank (`r={bt_config.rank}`, `chunk_size={bt_config.chunk_size}`) associative recurrent blocks while preserving {num_full} interleaved Full-Attention anchor layers, **{model_name}** delivers:",
         "- **105.0% Retention (+3.05%)** over `Qwen/Qwen3.5-2B` on the 10-task `lm-evaluation-harness` suite (`64.45%` vs. `61.40%` macro average).",
         "- **117.7% Retention (+3.83%)** over `Qwen/Qwen3.5-2B` on the 5-task `<think>` Generative Reasoning & Python Coding suite (`25.50%` vs. `21.67%` macro average, including `24.20%` MBPP Pass@1 and `25.67%` GPQA-Diamond).",
         "- **Up to 1.63x faster prefill, 1.09x faster autoregressive decoding, 2.3x smaller short-context cache, and 310 MB lower 32K Peak VRAM** than native `Qwen3.5-2B` on an NVIDIA RTX 4090—with **zero custom CUDA/Triton C++ dependencies** (`causal-conv1d` / `fla` not required).",
         "",
         "---",
         "",
-        "## Architecture Highlights",
+        "## 🏗️ Architecture Highlights",
         "",
         "| Property | Value |",
         "| :--- | :--- |",
         f"| **Architecture Type** | 3:1 Interleaved Hybrid (`{num_lrad}` CS-LRAD Recurrent + `{num_full}` Full-Attention) |",
-        f"| **Active Parameters** | `{active_params_m:.1f}M` (`bf16`, Static Weights VRAM: `3.55 GB`) |",
+        f"| **Active Parameters** | `{active_params_m:.1f}M` (`bf16`, Static Weights VRAM: `~{static_vram_gb:.2f} GB`) |",
         f"| **Hidden Dimension (`d_model`)** | `{bt_config.d_model}` (`{bt_config.num_heads}` Query Heads, `{bt_config.num_kv_heads}` KV Heads) |",
         f"| **CS-LRAD Low-Rank State (`r`)** | `rank = {bt_config.rank}`, `chunk_size = {bt_config.chunk_size}` |",
         "| **Context Window** | `32,768` tokens (512 chunks) |",
         f"| **Base Architecture Teacher** | `{base_teacher_id}` |",
-        f"| **Stage 4B/4C Skew-KD Teacher** | `{updistill_teacher_id}` (Top-64 Skew-KL + Skew-RKL + 1,500-Step 4-Pillar `<think>` Dr. GRPO) |",
+        f"| **Stage 4B/4C Skew-KD Teacher** | `{updistill_teacher_id}` (Top-64 Skew-KL + Skew-RKL + 4-Pillar `<think>` Dr. GRPO) |",
+        "| **Distillation Pipeline Repo** | [github.com/martin-kbcc/BareTorch_Layerwise_Distill](https://github.com/martin-kbcc/BareTorch_Layerwise_Distill) |",
         "",
         "---",
         "",
-        "## Quickstart: Loading & Inference (`transformers`)",
+        "## 🚀 Quickstart: Loading & Inference (`transformers` + `torch.compile`)",
         "",
-        "No external custom C++/CUDA packages are required—only `torch` and `transformers`. Simply pass `trust_remote_code=True`:",
+        "No external custom C++/CUDA packages are required—only `torch` and `transformers`. Simply pass `trust_remote_code=True`, and call **`model.compile_cs_lrad()`** to enable TorchInductor kernel fusion across all CS-LRAD blocks (accelerating both prefill and decoding with `dynamic=True` so variable prompt lengths never trigger recompilation stalls):",
         "",
-        "### 1. Single-Prompt Inference (Direct Mode & `<think>` Reasoning Mode)",
+        "### 1. Single-Prompt Inference (With `model.compile_cs_lrad()` Hardware Acceleration)",
         "",
         f"{FENCE}python",
         "import torch",
@@ -841,6 +886,11 @@ def generate_model_card_markdown(
         "    device_map=device,",
         "    trust_remote_code=True,",
         ").eval()",
+        "",
+        "# Compile all CS-LRAD blocks (chunk_forward, RMSNorms, SwiGLU MLPs) with dynamic=True",
+        "# Note: First call takes ~10s to JIT-compile fused Triton kernels; subsequent calls run at peak speed!",
+        "if torch.cuda.is_available():",
+        '    model.compile_cs_lrad(mode="default", dynamic=True)',
         "",
         "# Example: Step-by-Step <think> Math / Scientific Reasoning",
         "reasoning_prompt = (",
@@ -892,7 +942,7 @@ def generate_model_card_markdown(
         "",
         "---",
         "",
-        "## Benchmark Results",
+        "## 📊 Benchmark Results",
         "",
         "### 1. Non-Generative Benchmarks (`lm-evaluation-harness` 10-Task Suite)",
         "",
@@ -934,6 +984,24 @@ def generate_model_card_markdown(
         "| **32,768** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **587.5 ms** | **55,775 tok/s** | **49.9 tok/s** | **385.9 MB** | **2.70 GB** | **1.25x Prefill, 1.11x Decode, 1.21 GB Less VRAM (-31%)** |",
         "| 32,768 | Qwen3.5-0.8B (Native) | 731.9 ms | 44,770 tok/s | 45.1 tok/s | 403.6 MB | 3.91 GB | Baseline |",
         "",
+        "---",
+        "",
+        "## 🔗 Resources & Citation",
+        "",
+        "- **Layerwise Distillation & GRPO Pipeline Repository:** [github.com/martin-kbcc/BareTorch_Layerwise_Distill](https://github.com/martin-kbcc/BareTorch_Layerwise_Distill)",
+        "- **Core BareTorch Engine (PyTorch & MLX):** [github.com/martin-kbcc/baretorch](https://github.com/martin-kbcc/baretorch)",
+        "- **Technical Whitepaper:** [Read Technical Report (PDF)](https://github.com/martin-kbcc/baretorch-experiments/blob/main/paper.pdf)",
+        "",
+        f"{FENCE}bibtex",
+        "@article{kovacevic2026baretorch,",
+        "  title={BareTorch: Challenging State-of-The-Art Sequence Mixing Topologies via Kernel-Free, Pure GEMM-Compliant Architectures},",
+        "  author={Kovacevic Buvinic, Martin Ignacio},",
+        "  journal={BareTorch Framework Laboratory Technical Report},",
+        "  year={2026},",
+        "  url={https://github.com/martin-kbcc/baretorch}",
+        "}",
+        f"{FENCE}",
+        "",
     ]
     return "\n".join(lines)
 
@@ -945,8 +1013,9 @@ def generate_model_card_markdown(
 def run_verification_and_print_generations(load_source: str, device_str: str):
     """
     Loads the exported model via standard Hugging Face `AutoModelForCausalLM.from_pretrained`
-    with `trust_remote_code=True` (testing the exact developer experience from the Model Card),
-    runs both single-point and batched predictions, and prints all generated outputs.
+    with `trust_remote_code=True`, compiles CS-LRAD with `model.compile_cs_lrad()` (testing the
+    exact developer experience from the Model Card), runs both single-point and batched predictions,
+    and prints all generated outputs.
     """
     FENCE = "`" * 3
     print("\n" + "=" * 105)
@@ -970,9 +1039,14 @@ def run_verification_and_print_generations(load_source: str, device_str: str):
     ).to(device)
     model.eval()
 
-    full_attn_classes = [model.model.layers[i].__class__.__name__ for i in (3, 7, 11, 15, 19, 23)]
-    print(f"  - Verified Full-Attention Layer Classes (3,7,11,15,19,23): {full_attn_classes}")
+    full_attn_indices = [i for i, lt in enumerate(model.config.layer_types) if lt == "transformer"]
+    full_attn_classes = [model.model.layers[i].__class__.__name__ for i in full_attn_indices]
+    print(f"  - Verified Full-Attention Layer Classes {tuple(full_attn_indices)}: {full_attn_classes}")
     print(f"  - Verified Rotary Embedding Module: {type(model.model.rotary_emb).__name__}")
+
+    if device.type == "cuda" and hasattr(model, "compile_cs_lrad"):
+        print("  - Compiling CS-LRAD recurrent blocks via `model.compile_cs_lrad(mode='default', dynamic=True)`...")
+        model.compile_cs_lrad(mode="default", dynamic=True)
 
     eos_id = tokenizer.eos_token_id
     if tokenizer.pad_token_id is None:
@@ -1190,7 +1264,7 @@ def main():
             folder_path=args.export_dir,
             repo_id=args.repo_id,
             repo_type="model",
-            commit_message="Upload BareTorch CS-LRAD Hybrid Model, Safetensors weights, and Model Card",
+            commit_message="Update BareTorch Model Card and add model.compile_cs_lrad() helper",
         )
         print(f">>> Successfully uploaded to: https://huggingface.co/{args.repo_id}")
         print(f">>> Running remote Hugging Face Hub verification from '{args.repo_id}'...")

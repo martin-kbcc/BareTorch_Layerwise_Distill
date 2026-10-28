@@ -1,6 +1,7 @@
 # /home/martinkb/Desktop/BareTorch_Layerwise_Distill/baretorch/modeling_baretorch.py
 from functools import partial
 import inspect
+from typing import Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -350,7 +351,26 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         self._gradient_checkpointing_func = partial(checkpoint.checkpoint, use_reentrant=False)
         self.model = BareTorchModel(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self._is_cs_lrad_compiled = False
         self.post_init()
+
+    def compile_cs_lrad(self, mode: str = "default", dynamic: bool = True):
+        """
+        Compiles all CS-LRAD recurrent blocks (`chunk_forward`, `ln1`, `ln2`, `mlp`) using
+        `torch.compile(..., dynamic=True)` so arbitrary prompt lengths and batch sizes run at
+        peak fused Triton/Inductor speed without shape-recompilation stalls.
+        """
+        if getattr(self, "_is_cs_lrad_compiled", False):
+            return self
+        for layer in self.model.layers:
+            if isinstance(layer, LRADDecoderBlock) or "lrad" in layer.__class__.__name__.lower():
+                layer.ln1.forward = torch.compile(layer.ln1.forward, mode=mode, dynamic=dynamic)
+                layer.attn.chunk_forward = torch.compile(layer.attn.chunk_forward, mode=mode, dynamic=dynamic)
+                layer.ln2.forward = torch.compile(layer.ln2.forward, mode=mode, dynamic=dynamic)
+                layer.mlp.forward = torch.compile(layer.mlp.forward, mode=mode, dynamic=dynamic)
+        self.model.final_norm.forward = torch.compile(self.model.final_norm.forward, mode=mode, dynamic=dynamic)
+        self._is_cs_lrad_compiled = True
+        return self
 
     def get_input_embeddings(self):
         return self.model.token_embedding
@@ -383,6 +403,8 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         output_hidden_states=None,
         return_dict=None,
         num_logits_to_keep: int = 0,
+        logits_to_keep: Optional[Union[int, torch.Tensor]] = None,
+        **kwargs,
     ):
         return_dict = return_dict if return_dict is not None else bool(getattr(self.config, "return_dict", True))
 
@@ -400,13 +422,14 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
 
         hidden_states = outputs[0]
 
-        if num_logits_to_keep > 0 and hidden_states.size(1) > num_logits_to_keep:
-            hidden_states = hidden_states[:, -num_logits_to_keep:, :]
+        # Support both `logits_to_keep` (new HF GenerationMixin) and `num_logits_to_keep`
+        keep = logits_to_keep if logits_to_keep is not None else num_logits_to_keep
+        if isinstance(keep, int) and keep > 0 and hidden_states.size(1) > keep:
+            hidden_states = hidden_states[:, -keep:, :]
+        elif isinstance(keep, torch.Tensor):
+            hidden_states = hidden_states[:, keep, :]
 
         logits = self.lm_head(hidden_states)
-
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
 
         soft_cap = getattr(self.config, "logit_soft_cap", None)
         if soft_cap is not None and soft_cap > 0.0:
@@ -455,6 +478,8 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "use_cache": kwargs.get("use_cache", True),
+            "num_logits_to_keep": 1,
+            "logits_to_keep": 1,
         }
 
     def _reorder_cache(self, past_key_values, beam_idx):
