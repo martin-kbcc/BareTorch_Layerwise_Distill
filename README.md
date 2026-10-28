@@ -7,6 +7,7 @@
 [![Paper PDF](https://img.shields.io/badge/Paper-PDF-red.svg)](https://github.com/martin-kbcc/baretorch-experiments/blob/main/paper.pdf)
 [![Production Framework](https://img.shields.io/badge/Core_Engine-BareTorch-black?logo=github)](https://github.com/martin-kbcc/baretorch)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model%20Rampage-yellow)](https://huggingface.co/model-rampage)
+[![Live ZeroGPU Playground](https://img.shields.io/badge/%F0%9F%A4%97%20Live_ZeroGPU_Demo-BareTorch_Playground-ff9d00?style=flat&logo=huggingface)](https://huggingface.co/spaces/martin-kb-rampage/BareTorch-Qwen3.5-Playground)
 
 Welcome to the official **BareTorch Layerwise Up-Distillation & `<think>` GRPO Engine**. This repository houses our end-to-end multi-stage conversion, distillation, and verifiable reinforcement learning pipeline designed to transform pretrained foundation models (such as `Qwen/Qwen3.5-0.8B`, `2B`, and `4B`) into hardware-portable, **3:1 Interleaved CS-LRAD (Chunked Selective Low-Rank Associative Delta)** hybrid models in hours on an 8x NVIDIA H100 cluster.
 
