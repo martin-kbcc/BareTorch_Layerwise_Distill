@@ -198,7 +198,12 @@ def run_verification_suite(args):
 
     # -------------------------------------------------------------------------
     # TEST 6: Cross-Chunk Autoregressive Cache Equivalence (Prefill 70 + Step 5 vs Full 75)
+    # Evaluated in float32 to verify exact cross-chunk recurrent state equivalence
+    # without bfloat16 mantissa rounding tie-flips on untrained random projectors.
     # -------------------------------------------------------------------------
+    del teacher, t_backbone
+    student.float()
+
     ids_75 = torch.randint(10, 10000, (1, 75), device=device)
     full_logits = student(ids_75, use_cache=False).logits[:, 69:, :]
     out_prefill = student(ids_75[:, :70], use_cache=True)
@@ -211,11 +216,15 @@ def run_verification_suite(args):
     step_logits = torch.cat(step_logits, dim=1)
 
     cache_max_diff = (full_logits.float() - step_logits.float()).abs().max().item()
+    cache_cos_sim = F.cosine_similarity(full_logits.float(), step_logits.float(), dim=-1).mean().item()
     top1_agree = (full_logits.argmax(-1) == step_logits.argmax(-1)).float().mean().item()
-    t6_ok = top1_agree == 1.0 and cache_max_diff < 0.5
+    t6_ok = (top1_agree == 1.0) and (cache_max_diff < 1e-2) and (cache_cos_sim > 0.9999)
     all_passed = all_passed and t6_ok
-    print(f"\n[TEST 6] Autoregressive Generation Cache Equivalence (Cross-Chunk 70->75 tokens):")
-    print(f"  - Top-1 Token Agreement (Full vs Step) : {top1_agree*100:.1f}% (Max Diff: {cache_max_diff:.4f})  {'[PASS]' if t6_ok else '[FAIL]'}")
+    print(f"\n[TEST 6] Autoregressive Generation Cache Equivalence (Cross-Chunk 70->75 tokens, FP32):")
+    print(
+        f"  - Top-1 Token Agreement (Full vs Step) : {top1_agree*100:.1f}% "
+        f"(CosSim: {cache_cos_sim:.6f}, Max Diff: {cache_max_diff:.6f})  {'[PASS]' if t6_ok else '[FAIL]'}"
+    )
     print("=" * 90)
 
     if not all_passed:
