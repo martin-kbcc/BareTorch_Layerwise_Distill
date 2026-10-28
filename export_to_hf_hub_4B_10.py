@@ -79,7 +79,7 @@ def parse_args():
     parser.add_argument(
         "--hw_eval_json",
         type=str,
-        default="./hardware_benchmark_results.json",
+        default="./hardware_benchmark_results_4B.json",
         help="Optional path to hardware benchmark JSON report to auto-populate the Model Card table",
     )
     parser.add_argument(
@@ -704,7 +704,7 @@ except Exception:
 
 
 # ==============================================================================
-# 3. Model Card (`README.md`) Generator for 4B Hybrid with Static, Generative & Hardware Tables
+# 3. Model Card (`README.md`) Generator for 4B Hybrid (4B-Only Benchmarks)
 # ==============================================================================
 def load_optional_json(path: str) -> Optional[Dict[str, Any]]:
     if path and os.path.exists(path):
@@ -855,7 +855,7 @@ def generate_model_card_markdown(
         f"By replacing 75% of the backbone's token mixers ({num_lrad} of {bt_config.num_layers} layers) with pure-PyTorch `torch.compile`-compatible low-rank (`r={bt_config.rank}`, `chunk_size={bt_config.chunk_size}`) associative recurrent blocks while preserving {num_full} interleaved Full-Attention anchor layers, **{model_name}** delivers:",
         "- **100.7% Retention (+0.53%)** over `Qwen/Qwen3.5-4B` on the 10-task `lm-evaluation-harness` suite (`71.72%` vs. `71.19%` macro average, including `85.73%` on ARC-Easy, `63.40%` on ARC-Challenge, `97.40%` on SciQ, and `74.74%` on WinoGrande).",
         "- **103.5% Retention (+1.24%)** over `Qwen/Qwen3.5-4B` on the 5-task `<think>` Generative Reasoning & Python Coding suite (`37.03%` vs. `35.79%` macro average, including **`73.80%` on GSM8K**, **`33.00%` on MATH-500**, **`36.20%` Pass@1 on MBPP**, and **`25.61%` Pass@1 on HumanEval**).",
-        "- **100% Pure-GEMM Hardware Portability:** Runs out-of-the-box with **zero custom CUDA/Triton C++ dependencies** (`causal-conv1d` / `fla` not required), delivering $O(1)$ recurrent state updates across all 24 CS-LRAD layers up to **32,768 tokens**.",
+        "- **Up to 1.35x faster prefill, 1.18x faster autoregressive decoding, 2.6x smaller short-context cache, and 1.67 GB lower 32K Peak VRAM (-13.0%)** than native `Qwen3.5-4B` on an NVIDIA RTX 4090 (`11.22 GB` vs. `12.89 GB`)—with **zero custom CUDA/Triton C++ dependencies** (`causal-conv1d` / `fla` not required).",
         "",
         "---",
         "",
@@ -958,39 +958,24 @@ def generate_model_card_markdown(
         "### 2. Generative Reasoning & Coding Suite (5-Task `<think>` & Unit-Test Suite)",
         "",
         gen_table_md,
-        "### 3. Hardware Speed & Memory Footprint Across BareTorch Hybrid Scales (NVIDIA RTX 4090 — 512 to 32,768 Context)",
-        "",
-        "#### A. `BareTorch-Qwen3.5-2B-Hybrid` (`r=32`, Compiled) vs. Native `Qwen3.5-2B` on NVIDIA RTX 4090",
+        "### 3. Hardware Speed & Memory Footprint (`BareTorch-Qwen3.5-4B-Hybrid` vs. Native `Qwen3.5-4B` on NVIDIA RTX 4090 — 512 to 32,768 Context)",
         "",
         "| Context Length | Model | TTFT (ms) | Prefill (tok/s) | Decode (tok/s) | KV-Cache (MB) | Peak VRAM (GB) | Speedup / Memory Savings |",
         "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
-        "| **512** | **BareTorch-Qwen3.5-2B-Hybrid (r=32, Compiled)** | **24.4 ms** | **20,967 tok/s** | **47.6 tok/s** | **11.2 MB** | **3.65 GB** | **1.63x Prefill, 1.07x Decode, 2.3x Smaller Cache** |",
-        "| 512 | Qwen3.5-2B (Native) | 39.9 ms | 12,827 tok/s | 44.5 tok/s | 25.6 MB | 3.57 GB | Baseline |",
-        "| **1,024** | **BareTorch-Qwen3.5-2B-Hybrid (r=32, Compiled)** | **31.4 ms** | **32,618 tok/s** | **47.9 tok/s** | **17.2 MB** | **3.62 GB** | **1.27x Prefill, 1.07x Decode, 1.8x Smaller Cache** |",
-        "| 1,024 | Qwen3.5-2B (Native) | 39.8 ms | 25,706 tok/s | 44.8 tok/s | 31.6 MB | 3.61 GB | Baseline |",
-        "| **2,048** | **BareTorch-Qwen3.5-2B-Hybrid (r=32, Compiled)** | **61.6 ms** | **33,237 tok/s** | **47.0 tok/s** | **29.2 MB** | **3.70 GB** | **1.00x Prefill, 1.05x Decode, 1.5x Smaller Cache** |",
-        "| 2,048 | Qwen3.5-2B (Native) | 61.7 ms | 33,166 tok/s | 44.7 tok/s | 43.6 MB | 3.70 GB | Baseline |",
-        "| **4,096** | **BareTorch-Qwen3.5-2B-Hybrid (r=32, Compiled)** | **119.9 ms** | **34,169 tok/s** | **47.8 tok/s** | **53.2 MB** | **3.84 GB** | **1.03x Prefill, 1.05x Decode, 1.3x Smaller Cache** |",
-        "| 4,096 | Qwen3.5-2B (Native) | 123.1 ms | 33,263 tok/s | 45.5 tok/s | 67.6 MB | 3.86 GB | Baseline |",
-        "| **8,192** | **BareTorch-Qwen3.5-2B-Hybrid (r=32, Compiled)** | **253.3 ms** | **32,343 tok/s** | **47.7 tok/s** | **101.2 MB** | **4.13 GB** | **1.07x Prefill, 1.05x Decode, 1.1x Smaller Cache** |",
-        "| 8,192 | Qwen3.5-2B (Native) | 271.3 ms | 30,198 tok/s | 45.6 tok/s | 115.6 MB | 4.19 GB | Baseline |",
-        "| **16,384** | **BareTorch-Qwen3.5-2B-Hybrid (r=32, Compiled)** | **534.2 ms** | **30,672 tok/s** | **48.1 tok/s** | **197.2 MB** | **4.71 GB** | **1.08x Prefill, 1.09x Decode, 140 MB Less VRAM** |",
-        "| 16,384 | Qwen3.5-2B (Native) | 577.0 ms | 28,395 tok/s | 44.2 tok/s | 211.6 MB | 4.85 GB | Baseline |",
-        "| **32,768** | **BareTorch-Qwen3.5-2B-Hybrid (r=32, Compiled)** | **1191.9 ms** | **27,493 tok/s** | **46.8 tok/s** | **389.2 MB** | **5.87 GB** | **1.06x Prefill, 1.03x Decode, 310 MB Less VRAM** |",
-        "| 32,768 | Qwen3.5-2B (Native) | 1262.6 ms | 25,952 tok/s | 45.3 tok/s | 403.6 MB | 6.18 GB | Baseline |",
-        "",
-        "#### B. `BareTorch-Qwen3.5-0.8B-Hybrid` (`r=16`, Compiled) vs. Native `Qwen3.5-0.8B` on NVIDIA RTX 4090",
-        "",
-        "| Context Length | Model | TTFT (ms) | Prefill (tok/s) | Decode (tok/s) | KV-Cache (MB) | Peak VRAM (GB) | Speedup / Memory Savings |",
-        "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
-        "| **512** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **23.8 ms** | **21,555 tok/s** | **49.6 tok/s** | **7.9 MB** | **1.34 GB** | **1.63x Prefill, 1.10x Decode, 3.2x Smaller Cache** |",
-        "| 512 | Qwen3.5-0.8B (Native) | 38.8 ms | 13,205 tok/s | 44.9 tok/s | 25.6 MB | 1.49 GB | Baseline |",
-        "| **2,048** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **24.7 ms** | **82,767 tok/s** | **49.7 tok/s** | **25.9 MB** | **1.34 GB** | **1.58x Prefill, 1.11x Decode, 1.7x Smaller Cache** |",
-        "| 2,048 | Qwen3.5-0.8B (Native) | 39.2 ms | 52,277 tok/s | 44.8 tok/s | 43.6 MB | 1.61 GB | Baseline |",
-        "| **8,192** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **100.4 ms** | **81,586 tok/s** | **50.0 tok/s** | **97.9 MB** | **1.61 GB** | **1.31x Prefill, 1.13x Decode, 22% Lower VRAM** |",
-        "| 8,192 | Qwen3.5-0.8B (Native) | 131.9 ms | 62,122 tok/s | 44.3 tok/s | 115.6 MB | 2.07 GB | Baseline |",
-        "| **32,768** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **587.5 ms** | **55,775 tok/s** | **49.9 tok/s** | **385.9 MB** | **2.70 GB** | **1.25x Prefill, 1.11x Decode, 1.21 GB Less VRAM (-31%)** |",
-        "| 32,768 | Qwen3.5-0.8B (Native) | 731.9 ms | 44,770 tok/s | 45.1 tok/s | 403.6 MB | 3.91 GB | Baseline |",
+        "| **512** | **BareTorch-Qwen3.5-4B-Hybrid (r=32, Compiled)** | **39.8 ms** | **12,877 tok/s** | **37.2 tok/s** | **25.5 MB** | **7.67 GB** | **1.35x Prefill, 1.15x Decode, 2.6x Smaller Cache** |",
+        "| 512 | Qwen3.5-4B (Native) | 53.5 ms | 9,568 tok/s | 32.3 tok/s | 67.5 MB | 7.97 GB | Baseline |",
+        "| **1,024** | **BareTorch-Qwen3.5-4B-Hybrid (r=32, Compiled)** | **68.4 ms** | **14,962 tok/s** | **37.9 tok/s** | **41.5 MB** | **7.67 GB** | **1.10x Prefill, 1.17x Decode, 2.0x Smaller Cache** |",
+        "| 1,024 | Qwen3.5-4B (Native) | 75.4 ms | 13,585 tok/s | 32.5 tok/s | 83.5 MB | 8.05 GB | Baseline |",
+        "| **2,048** | **BareTorch-Qwen3.5-4B-Hybrid (r=32, Compiled)** | **132.5 ms** | **15,461 tok/s** | **36.9 tok/s** | **73.5 MB** | **7.78 GB** | **1.11x Prefill, 1.18x Decode, 1.6x Smaller Cache** |",
+        "| 2,048 | Qwen3.5-4B (Native) | 147.0 ms | 13,928 tok/s | 31.4 tok/s | 115.5 MB | 8.20 GB | Baseline |",
+        "| **4,096** | **BareTorch-Qwen3.5-4B-Hybrid (r=32, Compiled)** | **274.9 ms** | **14,899 tok/s** | **37.1 tok/s** | **137.5 MB** | **8.01 GB** | **1.11x Prefill, 1.13x Decode, 1.3x Smaller Cache** |",
+        "| 4,096 | Qwen3.5-4B (Native) | 306.0 ms | 13,385 tok/s | 32.7 tok/s | 179.5 MB | 8.52 GB | Baseline |",
+        "| **8,192** | **BareTorch-Qwen3.5-4B-Hybrid (r=32, Compiled)** | **579.8 ms** | **14,128 tok/s** | **37.3 tok/s** | **265.5 MB** | **8.47 GB** | **1.13x Prefill, 1.17x Decode, 670 MB Less VRAM** |",
+        "| 8,192 | Qwen3.5-4B (Native) | 655.3 ms | 12,502 tok/s | 31.8 tok/s | 307.5 MB | 9.14 GB | Baseline |",
+        "| **16,384** | **BareTorch-Qwen3.5-4B-Hybrid (r=32, Compiled)** | **1235.8 ms** | **13,257 tok/s** | **37.0 tok/s** | **521.5 MB** | **9.38 GB** | **1.12x Prefill, 1.12x Decode, 1.01 GB Less VRAM** |",
+        "| 16,384 | Qwen3.5-4B (Native) | 1389.9 ms | 11,788 tok/s | 32.9 tok/s | 563.5 MB | 10.39 GB | Baseline |",
+        "| **32,768** | **BareTorch-Qwen3.5-4B-Hybrid (r=32, Compiled)** | **2839.9 ms** | **11,538 tok/s** | **37.0 tok/s** | **1033.5 MB** | **11.22 GB** | **1.08x Prefill, 1.12x Decode, 1.67 GB Less VRAM (-13.0%)** |",
+        "| 32,768 | Qwen3.5-4B (Native) | 3071.2 ms | 10,669 tok/s | 33.0 tok/s | 1075.5 MB | 12.89 GB | Baseline |",
         "",
         "---",
         "",
@@ -1272,7 +1257,7 @@ def main():
             folder_path=args.export_dir,
             repo_id=args.repo_id,
             repo_type="model",
-            commit_message="Upload BareTorch-Qwen3.5-4B-Hybrid Model, Safetensors weights, and Model Card",
+            commit_message="Update BareTorch-Qwen3.5-4B-Hybrid Model Card with 4B-dedicated hardware benchmarks",
         )
         print(f">>> Successfully uploaded to: https://huggingface.co/{args.repo_id}")
         print(f">>> Running remote Hugging Face Hub verification from '{args.repo_id}'...")

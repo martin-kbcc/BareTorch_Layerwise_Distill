@@ -1,4 +1,4 @@
-# /home/martinkb/Desktop/BareTorch_Layerwise_Distill/export_to_hf_hub_10.py
+# /home/martinkb/Desktop/BareTorch_Layerwise_Distill/export_to_hf_hub_2B_10.py
 import os
 import sys
 import json
@@ -22,25 +22,25 @@ torch.backends.cuda.enable_cudnn_sdp(False)
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Stage 10: Self-Contained Hugging Face Hub Exporter, Model Card Generator & API Verifier"
+        description="Stage 10 (2B): Self-Contained Hugging Face Hub Exporter, Model Card Generator & API Verifier"
     )
     parser.add_argument(
         "--student_ckpt",
         type=str,
         default="./checkpoints_2B_hybrid/stage4c_grpo_math_code_1500steps_4B/best",
-        help="Path to the trained BareTorch Hybrid Student checkpoint directory",
+        help="Path to the trained BareTorch 2B Hybrid Student checkpoint directory",
     )
     parser.add_argument(
         "--student_base_id",
         type=str,
         default="Qwen/Qwen3.5-2B",
-        help="Base Qwen3.5 HF ID matching the Student architecture (e.g., Qwen/Qwen3.5-2B or Qwen/Qwen3.5-0.8B)",
+        help="Base Qwen3.5 HF ID matching the 2B Student architecture (default: Qwen/Qwen3.5-2B)",
     )
     parser.add_argument(
         "--updistill_teacher_id",
         type=str,
         default="Qwen/Qwen3.5-4B",
-        help="Larger Teacher used during Stage 4B/4C Skew-KD (e.g., Qwen/Qwen3.5-4B or Qwen/Qwen3.5-2B)",
+        help="Larger Teacher used during Stage 4B/4C Skew-KD (default: Qwen/Qwen3.5-4B)",
     )
     parser.add_argument(
         "--export_dir",
@@ -192,6 +192,7 @@ HF_MODELING_BARETORCH_PY = '''# Self-contained Hugging Face Hub modeling file fo
 from functools import partial
 import copy
 import inspect
+from typing import Optional, Union
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
@@ -220,7 +221,7 @@ def _build_qwen3_5_full_attn_components(config: BareTorchConfig):
     """
     Constructs a local `Qwen3_5TextConfig`, `Qwen3_5DecoderLayer` class, and rotary embedding
     module directly from `config.qwen_text_config_dict` so `BareTorchModel.__init__` builds
-    the exact full-attention layers (`model.layers.{3, 7, 11, ...}`) with 0 missing
+    the exact full-attention layers (`model.layers.{3, 7, 11, 15, 19, 23}`) with 0 missing
     or unexpected keys and 0 external Hub downloads.
     """
     q_dict = getattr(config, "qwen_text_config_dict", None)
@@ -557,14 +558,12 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         """
         if getattr(self, "_is_cs_lrad_compiled", False):
             return self
-        compiled_count = 0
         for layer in self.model.layers:
             if isinstance(layer, LRADDecoderBlock) or "lrad" in layer.__class__.__name__.lower():
                 layer.ln1.forward = torch.compile(layer.ln1.forward, mode=mode, dynamic=dynamic)
                 layer.attn.chunk_forward = torch.compile(layer.attn.chunk_forward, mode=mode, dynamic=dynamic)
                 layer.ln2.forward = torch.compile(layer.ln2.forward, mode=mode, dynamic=dynamic)
                 layer.mlp.forward = torch.compile(layer.mlp.forward, mode=mode, dynamic=dynamic)
-                compiled_count += 1
         self.model.final_norm.forward = torch.compile(self.model.final_norm.forward, mode=mode, dynamic=dynamic)
         self._is_cs_lrad_compiled = True
         return self
@@ -600,6 +599,8 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         output_hidden_states=None,
         return_dict=None,
         num_logits_to_keep: int = 0,
+        logits_to_keep: Optional[Union[int, torch.Tensor]] = None,
+        **kwargs,
     ):
         return_dict = return_dict if return_dict is not None else bool(getattr(self.config, "return_dict", True))
 
@@ -617,8 +618,12 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
 
         hidden_states = outputs[0]
 
-        if num_logits_to_keep > 0 and hidden_states.size(1) > num_logits_to_keep:
-            hidden_states = hidden_states[:, -num_logits_to_keep:, :]
+        # Support both `logits_to_keep` (new HF GenerationMixin) and `num_logits_to_keep`
+        keep = logits_to_keep if logits_to_keep is not None else num_logits_to_keep
+        if isinstance(keep, int) and keep > 0 and hidden_states.size(1) > keep:
+            hidden_states = hidden_states[:, -keep:, :]
+        elif isinstance(keep, torch.Tensor):
+            hidden_states = hidden_states[:, keep, :]
 
         logits = self.lm_head(hidden_states)
 
@@ -670,6 +675,7 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
             "position_ids": position_ids,
             "use_cache": kwargs.get("use_cache", True),
             "num_logits_to_keep": 1,
+            "logits_to_keep": 1,
         }
 
     def _reorder_cache(self, past_key_values, beam_idx):
@@ -698,7 +704,7 @@ except Exception:
 
 
 # ==============================================================================
-# 3. Model Card (`README.md`) Generator with Static, Generative & Hardware Tables
+# 3. Model Card (`README.md`) Generator for 2B Hybrid (2B-Only Benchmarks)
 # ==============================================================================
 def load_optional_json(path: str) -> Optional[Dict[str, Any]]:
     if path and os.path.exists(path):
@@ -721,7 +727,7 @@ def generate_model_card_markdown(
     hw_eval_data: Optional[Dict[str, Any]] = None,
 ) -> str:
     FENCE = "`" * 3
-    scale_tag = base_teacher_id.split("-")[-1]  # e.g. "0.8B", "2B", "4B"
+    scale_tag = base_teacher_id.split("-")[-1]  # "2B"
     model_name = repo_id if repo_id else f"model-rampage/BareTorch-{base_teacher_id.split('/')[-1]}-Hybrid"
     num_lrad = sum(1 for x in bt_config.layer_types if x == "cs_lrad")
     num_full = sum(1 for x in bt_config.layer_types if x == "transformer")
@@ -950,9 +956,7 @@ def generate_model_card_markdown(
         "### 2. Generative Reasoning & Coding Suite (5-Task `<think>` & Unit-Test Suite)",
         "",
         gen_table_md,
-        "### 3. Hardware Speed & Memory Footprint (NVIDIA RTX 4090 — 512 to 32,768 Context)",
-        "",
-        "#### A. `BareTorch-Qwen3.5-2B-Hybrid` (`r=32`, Compiled) vs. Native `Qwen3.5-2B` on NVIDIA RTX 4090",
+        "### 3. Hardware Speed & Memory Footprint (`BareTorch-Qwen3.5-2B-Hybrid` vs. Native `Qwen3.5-2B` on NVIDIA RTX 4090 — 512 to 32,768 Context)",
         "",
         "| Context Length | Model | TTFT (ms) | Prefill (tok/s) | Decode (tok/s) | KV-Cache (MB) | Peak VRAM (GB) | Speedup / Memory Savings |",
         "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
@@ -970,19 +974,6 @@ def generate_model_card_markdown(
         "| 16,384 | Qwen3.5-2B (Native) | 577.0 ms | 28,395 tok/s | 44.2 tok/s | 211.6 MB | 4.85 GB | Baseline |",
         "| **32,768** | **BareTorch-Qwen3.5-2B-Hybrid (r=32, Compiled)** | **1191.9 ms** | **27,493 tok/s** | **46.8 tok/s** | **389.2 MB** | **5.87 GB** | **1.06x Prefill, 1.03x Decode, 310 MB Less VRAM** |",
         "| 32,768 | Qwen3.5-2B (Native) | 1262.6 ms | 25,952 tok/s | 45.3 tok/s | 403.6 MB | 6.18 GB | Baseline |",
-        "",
-        "#### B. `BareTorch-Qwen3.5-0.8B-Hybrid` (`r=16`, Compiled) vs. Native `Qwen3.5-0.8B` on NVIDIA RTX 4090",
-        "",
-        "| Context Length | Model | TTFT (ms) | Prefill (tok/s) | Decode (tok/s) | KV-Cache (MB) | Peak VRAM (GB) | Speedup / Memory Savings |",
-        "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
-        "| **512** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **23.8 ms** | **21,555 tok/s** | **49.6 tok/s** | **7.9 MB** | **1.34 GB** | **1.63x Prefill, 1.10x Decode, 3.2x Smaller Cache** |",
-        "| 512 | Qwen3.5-0.8B (Native) | 38.8 ms | 13,205 tok/s | 44.9 tok/s | 25.6 MB | 1.49 GB | Baseline |",
-        "| **2,048** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **24.7 ms** | **82,767 tok/s** | **49.7 tok/s** | **25.9 MB** | **1.34 GB** | **1.58x Prefill, 1.11x Decode, 1.7x Smaller Cache** |",
-        "| 2,048 | Qwen3.5-0.8B (Native) | 39.2 ms | 52,277 tok/s | 44.8 tok/s | 43.6 MB | 1.61 GB | Baseline |",
-        "| **8,192** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **100.4 ms** | **81,586 tok/s** | **50.0 tok/s** | **97.9 MB** | **1.61 GB** | **1.31x Prefill, 1.13x Decode, 22% Lower VRAM** |",
-        "| 8,192 | Qwen3.5-0.8B (Native) | 131.9 ms | 62,122 tok/s | 44.3 tok/s | 115.6 MB | 2.07 GB | Baseline |",
-        "| **32,768** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **587.5 ms** | **55,775 tok/s** | **49.9 tok/s** | **385.9 MB** | **2.70 GB** | **1.25x Prefill, 1.11x Decode, 1.21 GB Less VRAM (-31%)** |",
-        "| 32,768 | Qwen3.5-0.8B (Native) | 731.9 ms | 44,770 tok/s | 45.1 tok/s | 403.6 MB | 3.91 GB | Baseline |",
         "",
         "---",
         "",
@@ -1157,7 +1148,7 @@ def main():
     os.makedirs(args.export_dir, exist_ok=True)
 
     print("=" * 105)
-    print("STAGE 10: PACKAGING BARETORCH HYBRID MODEL FOR HUGGING FACE HUB (`AutoModelForCausalLM`)")
+    print("STAGE 10 (2B): PACKAGING BARETORCH 2B HYBRID MODEL FOR HUGGING FACE HUB (`AutoModelForCausalLM`)")
     print(f"  - Source Checkpoint : {ckpt_to_load}")
     print(f"  - Base Architecture : {args.student_base_id}")
     print(f"  - Export Directory  : {args.export_dir}")
@@ -1165,7 +1156,7 @@ def main():
     print("=" * 105)
 
     # 1. Load Base Teacher Config & Reconstruct Trained Student
-    print("\n[1/5] Loading Base Qwen3.5 Text Config & Reconstructing BareTorch Hybrid Student...")
+    print("\n[1/5] Loading Base Qwen3.5-2B Text Config & Reconstructing BareTorch 2B Hybrid Student...")
     _, base_backbone, t_cfg = load_qwen3_5_text_teacher(
         args.student_base_id, dtype=torch.bfloat16, device="cpu"
     )
@@ -1214,7 +1205,7 @@ def main():
     tokenizer.save_pretrained(args.export_dir)
 
     # 4. Export Weights as `model.safetensors`
-    print("[4/5] Exporting model weights to `model.safetensors` and writing `README.md`...")
+    print("[4/5] Exporting 2B model weights to `model.safetensors` and writing `README.md`...")
     state_dict = {}
     seen_ptrs = set()
     for k, v in student.state_dict().items():
@@ -1264,7 +1255,7 @@ def main():
             folder_path=args.export_dir,
             repo_id=args.repo_id,
             repo_type="model",
-            commit_message="Update BareTorch Model Card and add model.compile_cs_lrad() helper",
+            commit_message="Update BareTorch-Qwen3.5-2B-Hybrid Model Card with 2B-dedicated hardware benchmarks",
         )
         print(f">>> Successfully uploaded to: https://huggingface.co/{args.repo_id}")
         print(f">>> Running remote Hugging Face Hub verification from '{args.repo_id}'...")
