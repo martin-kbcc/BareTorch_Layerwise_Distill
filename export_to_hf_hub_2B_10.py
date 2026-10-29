@@ -837,6 +837,7 @@ def generate_model_card_markdown(
         "",
         "[![GitHub Engine](https://img.shields.io/badge/GitHub-BareTorch_Engine-black?logo=github)](https://github.com/martin-kbcc/baretorch)",
         "[![Distillation Pipeline](https://img.shields.io/badge/GitHub-Layerwise_Distill_Pipeline-181717?logo=github)](https://github.com/martin-kbcc/BareTorch_Layerwise_Distill)",
+        "[![Live ZeroGPU Playground](https://img.shields.io/badge/%F0%9F%A4%97%20Live_ZeroGPU_Demo-BareTorch_Playground-ff9d00?style=flat&logo=huggingface)](https://huggingface.co/spaces/martin-kb-rampage/BareTorch-Qwen3.5-Playground)",
         "[![Paper PDF](https://img.shields.io/badge/Paper-PDF-red.svg)](https://github.com/martin-kbcc/baretorch-experiments/blob/main/paper.pdf)",
         "[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://apache.org/licenses/LICENSE-2.0)",
         "",
