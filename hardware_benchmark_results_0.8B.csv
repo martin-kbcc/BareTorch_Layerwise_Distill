@@ -1,0 +1,15 @@
+scale,model,params_m,compiled,context_len,ttft_ms,prefill_tok_s,decode_tok_s,kv_cache_mb,peak_vram_gb,status
+Qwen3.5-0.8B,"BareTorch-Qwen3.5-0.8B (r=16, Compiled)",662.0,True,512,23.6,21692.91,48.45,7.88,1.281,SUCCESS
+Qwen3.5-0.8B,"BareTorch-Qwen3.5-0.8B (r=16, Compiled)",662.0,True,1024,23.55,43474.48,51.24,13.88,1.297,SUCCESS
+Qwen3.5-0.8B,"BareTorch-Qwen3.5-0.8B (r=16, Compiled)",662.0,True,2048,24.71,82874.07,51.19,25.88,1.341,SUCCESS
+Qwen3.5-0.8B,"BareTorch-Qwen3.5-0.8B (r=16, Compiled)",662.0,True,4096,45.52,89972.55,51.41,49.88,1.432,SUCCESS
+Qwen3.5-0.8B,"BareTorch-Qwen3.5-0.8B (r=16, Compiled)",662.0,True,8192,100.93,81165.54,50.6,97.88,1.612,SUCCESS
+Qwen3.5-0.8B,"BareTorch-Qwen3.5-0.8B (r=16, Compiled)",662.0,True,16384,235.46,69583.97,50.55,193.88,1.973,SUCCESS
+Qwen3.5-0.8B,"BareTorch-Qwen3.5-0.8B (r=16, Compiled)",662.0,True,32768,586.42,55878.31,51.37,385.88,2.698,SUCCESS
+Qwen3.5-0.8B,Qwen3.5-0.8B (Native),752.4,False,512,38.16,13418.86,44.36,25.59,1.491,SUCCESS
+Qwen3.5-0.8B,Qwen3.5-0.8B (Native),752.4,False,1024,38.66,26487.26,45.25,31.59,1.53,SUCCESS
+Qwen3.5-0.8B,Qwen3.5-0.8B (Native),752.4,False,2048,38.9,52650.98,45.17,43.59,1.607,SUCCESS
+Qwen3.5-0.8B,Qwen3.5-0.8B (Native),752.4,False,4096,62.21,65844.7,45.52,67.59,1.76,SUCCESS
+Qwen3.5-0.8B,Qwen3.5-0.8B (Native),752.4,False,8192,131.01,62530.7,45.38,115.59,2.066,SUCCESS
+Qwen3.5-0.8B,Qwen3.5-0.8B (Native),752.4,False,16384,306.16,53515.1,45.55,211.59,2.68,SUCCESS
+Qwen3.5-0.8B,Qwen3.5-0.8B (Native),752.4,False,32768,729.71,44905.6,44.2,403.59,3.909,SUCCESS

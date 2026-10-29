@@ -117,7 +117,7 @@ class BareTorchConfig(PretrainedConfig):
         num_layers=24,
         intermediate_size=3584,
         chunk_size=64,
-        rank=32,
+        rank=16,
         dropout=0.0,
         max_seq_len=32768,
         use_grad_checkpointing=False,
@@ -809,35 +809,6 @@ def generate_model_card_markdown(
     for r in gen_rows:
         gen_table_md += f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |\n"
 
-    hw_section_lines = []
-    if hw_eval_data and "results" in hw_eval_data and isinstance(hw_eval_data["results"], list):
-        hw_section_lines = [
-            "### 3. Hardware Speed & Memory Footprint (`BareTorch-Qwen3.5-0.8B-Hybrid` vs. Native `Qwen3.5-0.8B` on NVIDIA RTX 4090 — 512 to 32,768 Context)",
-            "",
-            "| Context Length | Model | TTFT (ms) | Prefill (tok/s) | Decode (tok/s) | KV-Cache (MB) | Peak VRAM (GB) | Speedup / Memory Savings |",
-            "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
-        ]
-        for entry in hw_eval_data["results"]:
-            ctx = entry.get("context_len", "")
-            s_ttft = entry.get("student_ttft_ms", 0.0)
-            t_ttft = entry.get("teacher_ttft_ms", 0.0)
-            s_pref = entry.get("student_prefill_tps", 0.0)
-            t_pref = entry.get("teacher_prefill_tps", 0.0)
-            s_dec = entry.get("student_decode_tps", 0.0)
-            t_dec = entry.get("teacher_decode_tps", 0.0)
-            s_kv = entry.get("student_cache_mb", 0.0)
-            t_kv = entry.get("teacher_cache_mb", 0.0)
-            s_vram = entry.get("student_peak_vram_gb", 0.0)
-            t_vram = entry.get("teacher_peak_vram_gb", 0.0)
-            summary = entry.get("summary", "Sub-Quadratic O(1) State")
-            hw_section_lines.append(
-                f"| **{ctx}** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=32, Compiled)** | **{s_ttft:.1f} ms** | **{s_pref:,.0f} tok/s** | **{s_dec:.1f} tok/s** | **{s_kv:.1f} MB** | **{s_vram:.2f} GB** | **{summary}** |"
-            )
-            hw_section_lines.append(
-                f"| {ctx} | Qwen3.5-0.8B (Native) | {t_ttft:.1f} ms | {t_pref:,.0f} tok/s | {t_dec:.1f} tok/s | {t_kv:.1f} MB | {t_vram:.2f} GB | Baseline |"
-            )
-        hw_section_lines.append("")
-
     lines = [
         "---",
         "library_name: transformers",
@@ -884,7 +855,7 @@ def generate_model_card_markdown(
         f"By replacing 75% of the backbone's token mixers ({num_lrad} of {bt_config.num_layers} layers) with pure-PyTorch `torch.compile`-compatible low-rank (`r={bt_config.rank}`, `chunk_size={bt_config.chunk_size}`) associative recurrent blocks while preserving {num_full} interleaved Full-Attention anchor layers, **{model_name}** delivers:",
         "- **106.6% Retention (+3.63%)** over `Qwen/Qwen3.5-0.8B` on the 10-task `lm-evaluation-harness` suite (`58.45%` vs. `54.83%` macro average, including `+12.58%` on ARC-Easy, `+9.80%` on SciQ, and `+8.32%` on BoolQ).",
         "- **174.5% Retention (+8.54%)** over `Qwen/Qwen3.5-0.8B` on the 5-task `<think>` Generative Reasoning & Python Coding suite (`20.01%` vs. `11.47%` macro average, including `35.80%` GSM8K CoT, `27.68%` GPQA-Diamond, `16.80%` MBPP Pass@1, and `10.98%` HumanEval Pass@1).",
-        "- **Zero Custom CUDA/Triton Kernels Required:** Runs out-of-the-box via standard PyTorch `AutoModelForCausalLM` and accelerates automatically via `model.compile_cs_lrad()` (`causal-conv1d` / `fla` not required).",
+        "- **Up to 1.64x faster prefill, 1.16x faster autoregressive decoding, 3.2x smaller short-context cache, 12% fewer active parameters (`662.0M` vs. `752.4M`), and 1.21 GB lower 32K Peak VRAM** than native `Qwen3.5-0.8B` on an NVIDIA RTX 4090—with **zero custom CUDA/Triton C++ dependencies** (`causal-conv1d` / `fla` not required).",
         "",
         "---",
         "",
@@ -893,7 +864,7 @@ def generate_model_card_markdown(
         "| Property | Value |",
         "| :--- | :--- |",
         f"| **Architecture Type** | 3:1 Interleaved Hybrid (`{num_lrad}` CS-LRAD Recurrent + `{num_full}` Full-Attention) |",
-        f"| **Active Parameters** | `{active_params_m:.1f}M` (`bf16`, Static Weights VRAM: `~{static_vram_gb:.2f} GB`) |",
+        f"| **Active Parameters** | `{active_params_m:.1f}M` (`bf16`, Static Weights VRAM: `~{static_vram_gb:.2f} GB` vs. `752.4M` / `1.43 GB` Teacher) |",
         f"| **Hidden Dimension (`d_model`)** | `{bt_config.d_model}` (`{bt_config.num_heads}` Query Heads, `{bt_config.num_kv_heads}` KV Heads) |",
         f"| **CS-LRAD Low-Rank State (`r`)** | `rank = {bt_config.rank}`, `chunk_size = {bt_config.chunk_size}` |",
         "| **Context Window** | `32,768` tokens (512 chunks) |",
@@ -987,7 +958,25 @@ def generate_model_card_markdown(
         "### 2. Generative Reasoning & Coding Suite (5-Task `<think>` & Unit-Test Suite)",
         "",
         gen_table_md,
-        *hw_section_lines,
+        "### 3. Hardware Speed & Memory Footprint (`BareTorch-Qwen3.5-0.8B-Hybrid` vs. Native `Qwen3.5-0.8B` on NVIDIA RTX 4090 — 512 to 32,768 Context)",
+        "",
+        "| Context Length | Model | TTFT (ms) | Prefill (tok/s) | Decode (tok/s) | KV-Cache (MB) | Peak VRAM (GB) | Speedup / Memory Savings |",
+        "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
+        "| **512** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **23.6 ms** | **21,693 tok/s** | **48.5 tok/s** | **7.9 MB** | **1.28 GB** | **1.62x Prefill, 1.09x Decode, 3.2x Smaller Cache** |",
+        "| 512 | Qwen3.5-0.8B (Native) | 38.2 ms | 13,419 tok/s | 44.4 tok/s | 25.6 MB | 1.49 GB | Baseline |",
+        "| **1,024** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **23.6 ms** | **43,474 tok/s** | **51.2 tok/s** | **13.9 MB** | **1.30 GB** | **1.64x Prefill, 1.13x Decode, 2.3x Smaller Cache** |",
+        "| 1,024 | Qwen3.5-0.8B (Native) | 38.7 ms | 26,487 tok/s | 45.2 tok/s | 31.6 MB | 1.53 GB | Baseline |",
+        "| **2,048** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **24.7 ms** | **82,874 tok/s** | **51.2 tok/s** | **25.9 MB** | **1.34 GB** | **1.57x Prefill, 1.13x Decode, 1.7x Smaller Cache** |",
+        "| 2,048 | Qwen3.5-0.8B (Native) | 38.9 ms | 52,651 tok/s | 45.2 tok/s | 43.6 MB | 1.61 GB | Baseline |",
+        "| **4,096** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **45.5 ms** | **89,973 tok/s** | **51.4 tok/s** | **49.9 MB** | **1.43 GB** | **1.37x Prefill, 1.13x Decode, 1.4x Smaller Cache** |",
+        "| 4,096 | Qwen3.5-0.8B (Native) | 62.2 ms | 65,845 tok/s | 45.5 tok/s | 67.6 MB | 1.76 GB | Baseline |",
+        "| **8,192** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **100.9 ms** | **81,166 tok/s** | **50.6 tok/s** | **97.9 MB** | **1.61 GB** | **1.30x Prefill, 1.12x Decode, 1.2x Smaller Cache** |",
+        "| 8,192 | Qwen3.5-0.8B (Native) | 131.0 ms | 62,531 tok/s | 45.4 tok/s | 115.6 MB | 2.07 GB | Baseline |",
+        "| **16,384** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **235.5 ms** | **69,584 tok/s** | **50.6 tok/s** | **193.9 MB** | **1.97 GB** | **1.30x Prefill, 1.11x Decode, 710 MB Less VRAM** |",
+        "| 16,384 | Qwen3.5-0.8B (Native) | 306.2 ms | 53,515 tok/s | 45.6 tok/s | 211.6 MB | 2.68 GB | Baseline |",
+        "| **32,768** | **BareTorch-Qwen3.5-0.8B-Hybrid (r=16, Compiled)** | **586.4 ms** | **55,878 tok/s** | **51.4 tok/s** | **385.9 MB** | **2.70 GB** | **1.24x Prefill, 1.16x Decode, 1.21 GB Less VRAM** |",
+        "| 32,768 | Qwen3.5-0.8B (Native) | 729.7 ms | 44,906 tok/s | 44.2 tok/s | 403.6 MB | 3.91 GB | Baseline |",
+        "",
         "---",
         "",
         "## 🔗 Resources & Citation",
@@ -1053,9 +1042,15 @@ def run_verification_and_print_generations(load_source: str, device_str: str):
         print("  - Compiling CS-LRAD recurrent blocks via `model.compile_cs_lrad(mode='default', dynamic=True)`...")
         model.compile_cs_lrad(mode="default", dynamic=True)
 
-    eos_id = tokenizer.eos_token_id
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = eos_id
+    eos_ids = []
+    for tok_str in ["<|endoftext|>", "<|im_end|>", "<|end|>"]:
+        tid = tokenizer.convert_tokens_to_ids(tok_str)
+        if isinstance(tid, int) and tid >= 0 and tid != tokenizer.unk_token_id and tid not in eos_ids:
+            eos_ids.append(tid)
+    if tokenizer.eos_token_id not in eos_ids:
+        eos_ids.insert(0, tokenizer.eos_token_id)
+
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_ids[0]
 
     # --- Test 1: Single-Point Predictions (Direct Q&A, <think> Math CoT, Python Code) ---
     single_prompts = [
@@ -1089,14 +1084,17 @@ def run_verification_and_print_generations(load_source: str, device_str: str):
             **inp,
             max_new_tokens=max_new,
             do_sample=False,
+            repetition_penalty=1.08,
+            no_repeat_ngram_size=5,
             use_cache=True,
-            pad_token_id=eos_id,
-            eos_token_id=eos_id,
+            pad_token_id=pad_id,
+            eos_token_id=eos_ids,
         )
         gen_toks = out_ids[0, p_len:].tolist()
-        if eos_id in gen_toks:
-            gen_toks = gen_toks[: gen_toks.index(eos_id)]
-        gen_text = tokenizer.decode(gen_toks, skip_special_tokens=False)
+        for eid in eos_ids:
+            if eid in gen_toks:
+                gen_toks = gen_toks[: gen_toks.index(eid)]
+        gen_text = tokenizer.decode(gen_toks, skip_special_tokens=True)
 
         for stop_s in ("\nQuestion:", "\n\nQuestion:", "\nQuestion 2:"):
             if stop_s in gen_text:
@@ -1120,6 +1118,8 @@ def run_verification_and_print_generations(load_source: str, device_str: str):
     ]
 
     tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = pad_id
     batch_enc = tokenizer(batch_prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
     padded_p_len = batch_enc["input_ids"].shape[1]
 
@@ -1127,16 +1127,19 @@ def run_verification_and_print_generations(load_source: str, device_str: str):
         **batch_enc,
         max_new_tokens=112,
         do_sample=False,
+        repetition_penalty=1.08,
+        no_repeat_ngram_size=5,
         use_cache=True,
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=eos_id,
+        eos_token_id=eos_ids,
     )
 
     for idx, b_prompt in enumerate(batch_prompts):
         b_toks = batch_out[idx, padded_p_len:].tolist()
-        if eos_id in b_toks:
-            b_toks = b_toks[: b_toks.index(eos_id)]
-        b_txt = tokenizer.decode(b_toks, skip_special_tokens=False)
+        for eid in eos_ids:
+            if eid in b_toks:
+                b_toks = b_toks[: b_toks.index(eid)]
+        b_txt = tokenizer.decode(b_toks, skip_special_tokens=True)
         for stop_s in ("\nQuestion:", "\n\nQuestion:", "\nQuestion 2:"):
             if stop_s in b_txt:
                 b_txt = b_txt.split(stop_s, 1)[0]
@@ -1184,6 +1187,14 @@ def main():
     del base_backbone
     tokenizer = AutoTokenizer.from_pretrained(ckpt_to_load, trust_remote_code=True)
 
+    eos_ids = []
+    for tok_str in ["<|endoftext|>", "<|im_end|>", "<|end|>"]:
+        tid = tokenizer.convert_tokens_to_ids(tok_str)
+        if isinstance(tid, int) and tid >= 0 and tid != tokenizer.unk_token_id and tid not in eos_ids:
+            eos_ids.append(tid)
+    if tokenizer.eos_token_id not in eos_ids:
+        eos_ids.insert(0, tokenizer.eos_token_id)
+
     # 2. Write Self-Contained Custom Code
     print("[2/5] Writing self-contained custom modeling files (`configuration_baretorch.py`, `modeling_baretorch.py`)...")
     repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -1205,6 +1216,8 @@ def main():
     cfg_dict["model_type"] = "baretorch_hybrid"
     cfg_dict["qwen_text_config_dict"] = q_dict
     cfg_dict["qwen_rotary_inv_freq"] = inv_freq_list
+    cfg_dict["eos_token_id"] = eos_ids
+    cfg_dict["repetition_penalty"] = 1.08
     cfg_dict["use_grad_checkpointing"] = False
     cfg_dict["gradient_checkpointing"] = False
     cfg_dict["architectures"] = ["BareTorchForCausalLM"]
@@ -1215,6 +1228,20 @@ def main():
     }
     with open(os.path.join(args.export_dir, "config.json"), "w") as f:
         json.dump(cfg_dict, f, indent=2)
+
+    gen_cfg = {
+        "bos_token_id": 248044,
+        "eos_token_id": eos_ids,
+        "pad_token_id": 248044,
+        "max_new_tokens": 256,
+        "do_sample": False,
+        "repetition_penalty": 1.08,
+        "no_repeat_ngram_size": 5,
+        "use_cache": True,
+        "transformers_version": "4.48.0",
+    }
+    with open(os.path.join(args.export_dir, "generation_config.json"), "w") as f:
+        json.dump(gen_cfg, f, indent=2)
 
     tokenizer.save_pretrained(args.export_dir)
 
@@ -1269,7 +1296,7 @@ def main():
             folder_path=args.export_dir,
             repo_id=args.repo_id,
             repo_type="model",
-            commit_message="Release BareTorch-Qwen3.5-0.8B-Hybrid weights, self-contained modeling code, and benchmarks",
+            commit_message="Update BareTorch-Qwen3.5-0.8B-Hybrid Model Card with RTX 4090 hardware benchmarks and r=16 config",
         )
         print(f">>> Successfully uploaded to: https://huggingface.co/{args.repo_id}")
         print(f">>> Running remote Hugging Face Hub verification from '{args.repo_id}'...")
